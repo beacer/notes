@@ -14,39 +14,39 @@ Linux的网桥是虚拟设备，需要将其他设备作为其网桥端口才能
 
 例如，使用“brctl”（或者ip link add type bridge）添加一个网桥设备，添加后它并没有任何网桥端口（即Interface）。
 
-    ```bash
-    # brctl addbr br0
-    # brctl show
-    bridge name     bridge id          STP enabled     interfaces
-    br0             8000.000000000000           no          
-    ```
+```bash
+# brctl addbr br0
+# brctl show
+bridge name     bridge id          STP enabled     interfaces
+br0             8000.000000000000           no          
+```
 
 再为它加上Interface，
 
-    ```
-    # brctl addif br0 eth0
-    # brctl addif br0 eth1
-    # brctl show
-    bridge name     bridge id          STP enabled     interfaces
-    br0             8000.08002747113f           no           eth0
-                                                             eth1
-    ```
+```bash
+# brctl addif br0 eth0
+# brctl addif br0 eth1
+# brctl show
+bridge name     bridge id          STP enabled     interfaces
+br0             8000.08002747113f           no           eth0
+                                                         eth1
+```
 
 如果要让br0开始工作，需要将其链路（link）状态打开（UP），可能还需要为它设置个IP地址。这些方面和普通接口是一样的，可以使用ifconfig命令，或者是ip命令。
 
-    ```bash
-    # ip link set br0 up
-    # ip addr add 10.0.0.1/24 dev br0 broadcast +
-    ```
+```bash
+# ip link set br0 up
+# ip addr add 10.0.0.1/24 dev br0 broadcast +
+```
 
 我们要注意的是网桥ID的定义：“优先级”+某个端口的MAC地址。而后来的标准中“优先级”其实只用了4位，后面12位作为系统ID扩展。
 
-    ```bash
-       4 bits  12 Bits                48 Bits
-      +------+----------+----------------------------------+
-      | Prio | SysID Ex |           MAC Address            |
-      +------+----------+----------------------------------+
-    ```
+```bash
+   4 bits  12 Bits                48 Bits
+  +------+----------+----------------------------------+
+  | Prio | SysID Ex |           MAC Address            |
+  +------+----------+----------------------------------+
+```
 
 Prio使用4Bits，那么优先级的增量（每个Prio对应的Extension数目）是4096（2^12）。这样使用一个Prio和MAC标识的网桥表示4096个网桥（实例），它们可以出现在不同的网桥ID空间中。这么做并非随意为之，802.1Q允许的最大VLAN个数就是4096。那么就是说，每个VLAN所在的网桥ID空间，可以使用Prio+MAC标识一个网桥。事实上Cisco私有STP实现对SysID Ex的解释正是VLAN ID。
 

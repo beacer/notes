@@ -1,4 +1,4 @@
-OpenWRT之网络管理 - *netifd*
+OpenWRT之 *netifd* - 概述
 ========================
 
 * [netifd对象概述](#object)
@@ -267,11 +267,11 @@ reload_service() {
 Porotocol handler应该响应来自interface的外部命令，
 
 ```c++
-enum interface_proto_cmd { 
-    PROTO_CMD_SETUP, 
-    PROTO_CMD_TEARDOWN, 
-    PROTO_CMD_RENEW, // 这个命令可选 
-}; 
+enum interface_proto_cmd {
+    PROTO_CMD_SETUP,
+    PROTO_CMD_TEARDOWN,
+    PROTO_CMD_RENEW, // 这个命令可选
+};
 ```
 
 考虑到协议配置需要一个过程，这些命令通常以的执行为异步方式（因为不能阻塞命令发送方），命令的结果稍后通过事件IFPEV_XXX返回。
@@ -287,7 +287,7 @@ enum interface_proto_event {
 
 proto_handler接收命令，调用外部脚本、进程执行协议配置工作，然后把协议配置的结果通过Event返回interface的流程可以用下图表示。
 
-<div align=center><img src="images/netifd-proto-dhcp.png" width="" height="" alt="netifd配置框架"/></div>
+<div align=center><img src="images/netifd-proto-dhcp.png" width="80%" height="80%" alt="netifd配置框架"/></div>
 
 如果命令可以在短时间内完成，命令的callback可以立即发送event。否则就是要uloop调度异步行为。因此那些简单的协议，可以设置PROTO_FLAG_IMMEDIATE标记，那么就不需要自己调度IFPEV_UP/DOWN，而是由核心代码（在cmd callback结束后）自动生成Event。
 

@@ -6,12 +6,13 @@ OpenWRT之网络管理 - *netifd*
   - [接口对象 interface{}](#interface)
   - [协议处理对象 proto_handler{}](#protocol)
   - [对象关系图](#objects-pic)
-* [netifd架构](#arch)
+* [netifd配置架构](#config-arch)
   - [UCI和配置文件](#uci)
-  - [修改配置](#config-modify)
+  - [修改配置步骤](#config-modify)
   - [netifd ubus接口](#ubus)
+  - [初始化脚本](#init-script)
   - [网络协议脚本](#network-script)
-  - [参考文档](#config-doc)
+* [参考文档](#config-doc)
 
 <a id="object" />
 netifd对象概述
@@ -117,8 +118,8 @@ netifd内部对象分为3个层次： `device{}`, `interface{}` 和 `protocol{}`
 <!-- ![对象关系](images/netifd-objects.png) -->
 <div align=center><img src="images/netifd-objects.png" width="80%" height="80%" alt="netifd对象关系"/></div>
 
-<a id="arch" />
-netifd架构
+<a id="config-arch" />
+netifd配置架构
 ------------
 
 暂时跳出关乎内部实现的各种对象，从外部看看netifd如何与其他模块的关联，主要是如何对它进行配置。这里先给出一张图，好有个基本的概念。
@@ -162,7 +163,7 @@ config interface 'wan'
 配置文件分成若干section，section以关键字"config"所在行开头，config后面跟section类型和名字，例如上面的配置包含了3个'interface'类型的section，名字分别是'loopback', 'lan'和'wan'。netifd一边解析配置文件，一边构建其内部的数据结构（对象），根据上述配置，就会建立其3个`interface{}`对象和它相关的`device{}`对象。不过并非所有对象都在解析配置文件的时候建立，`proto_handler{}`可能是内置的；而`interface_proto_state{}`则运行时建立。
 
 <a id="config-modify" />
-#### 修改配置
+#### 修改配置步骤
 
 配置OpenWRT网络部分（不仅仅是负责接口和配置管理的netifd，还包括wireless和switch等部分）的一般步骤为：
 
@@ -219,22 +220,84 @@ root@OpenWrt:/# ubus list -v network
 
 而接口对象`network.interface`支持了其他一些method，打开关闭等皆可通过ubus命令查看，可通过命令查看，不在累述。
 
+<a id="init-script" />
+#### 初始化脚本
+
+按照Unix惯例放在`/etc/init.d/*`，netifd的初始化脚本是`/etc/init.d/network`。负责重启或重新加载网络管理模块，它不光负责启动netifd，还会操作wifi等部分。
+
+对于netifd的“start”，脚本完成的工作是，
+* 把netifd放入procd(OpenWRT的进程管理模块)的管理中，
+* 告诉procd netifd启动成功的条件是生成了ubus对象network.interface
+* 如果netifd异常退出，procd负责把它重新带起来。
+* 同时会设置ulimit打开coredump限制，如果netifd异常退出产生coredump文件，会被保存到/tmp目录下。
+
+对应的`/etc/init.d/network`代码片段如下，
+
+```bash
+start_service() {
+        init_switch
+
+        procd_open_instance
+        procd_set_param command /sbin/netifd
+        procd_set_param respawn
+        procd_set_param watch network.interface
+        [ -e /proc/sys/kernel/core_pattern ] && {
+                procd_set_param limits core="unlimited"
+                echo '/tmp/%e.%p.%s.%t.core' > /proc/sys/kernel/core_pattern
+        }
+        procd_close_instance
+}
+```
+
+而reload相对简单，直接通过ubus接口通知netifd进程重新读取并应用配置文件，
+
+```bash
+reload_service() {
+        init_switch
+        ubus call network reload
+        /sbin/wifi reload_legacy
+}
+```
+
 <a id="network-script" />
 #### 网络协议脚本
 
+`proto_handler{}`会attach到对协议事件感兴趣的实体，例如`interface{}`。协议状态由`interface_proto_state{}`跟踪。
 
+Porotocol handler应该响应来自interface的外部命令，
 
+```c++
+enum interface_proto_cmd { 
+    PROTO_CMD_SETUP, 
+    PROTO_CMD_TEARDOWN, 
+    PROTO_CMD_RENEW, // 这个命令可选 
+}; 
+```
 
+考虑到协议配置需要一个过程，这些命令通常以的执行为异步方式（因为不能阻塞命令发送方），命令的结果稍后通过事件IFPEV_XXX返回。
 
+```c++
+enum interface_proto_event {
+    IFPEV_UP,
+    IFPEV_DOWN,
+    IFPEV_LINK_LOST,
+    IFPEV_RENEW,
+};
+```
 
+proto_handler接收命令，调用外部脚本、进程执行协议配置工作，然后把协议配置的结果通过Event返回interface的流程可以用下图表示。
 
+<div align=center><img src="images/netifd-proto-dhcp.png" width="" height="" alt="netifd配置框架"/></div>
 
+如果命令可以在短时间内完成，命令的callback可以立即发送event。否则就是要uloop调度异步行为。因此那些简单的协议，可以设置PROTO_FLAG_IMMEDIATE标记，那么就不需要自己调度IFPEV_UP/DOWN，而是由核心代码（在cmd callback结束后）自动生成Event。
 
 <a id="config-doc" />
-#### 参考文档
+参考文档
+------------
 
 关于UCI和各个配置文件的详细介绍，可参考OpenWRT官方文档，
 
+ - netifd DESIGN文件
  - http://wiki.openwrt.org/doc/techref/uci
  - http://wiki.openwrt.org/doc/techref/initscripts
  - http://wiki.openwrt.org/doc/devel/config-scripting

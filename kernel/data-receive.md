@@ -100,14 +100,12 @@ static int __init net_dev_init(void)
 
 ```c++
 // net/core/dev.c
-
 DEFINE_PER_CPU_ALIGNED(struct softnet_data, softnet_data);
 
 // include/linux/netdevice.h
-
 struct softnet_data {
     struct list_head    poll_list;     // 需要ingress轮询的dev列表，“设备”用相关的napi_struct表示
-    struct sk_buff_head process_queue; // 旧式积压队列 netif_rx()对应的process_backlog，
+    struct sk_buff_head process_queue; // 用于Non-NAPI设备，旧式积压队列，函数process_backlog()把
                                        // skb从sd->input_pkt_queue装异到此处，再进行收取
 
     /* stats */
@@ -115,13 +113,13 @@ struct softnet_data {
     unsigned int        time_squeeze;
     unsigned int        cpu_collision;
     unsigned int        received_rps;
-    ... RPS和Net FLOW ...
-    struct Qdisc        *output_queue;
+    // ... RPS 和 Net FLOW ...
+    struct Qdisc        *output_queue;     // TX队列规则
     struct Qdisc        **output_queue_tailp;
-    struct sk_buff      *completion_queue;
+    struct sk_buff      *completion_queue; // 完成TX可以释放的skb
     
 #ifdef CONFIG_RPS
-    ... ...
+    // ... ...
 #endif
     unsigned int        dropped;         // 丢包统计，例如队列已满
     struct sk_buff_head input_pkt_queue; // 用于Non-NAPI设备，驱动分配skb，读取数据，把skb放入该队列
@@ -130,38 +128,76 @@ struct softnet_data {
 };  
 ```
 
-先说明一下，旧式的设备驱动指调用`netif_rx()`的设备或者`non-NAPI`设备。
+> 其中的某些字段和`Receive Packet Steering(RPS)`，RPS通过将接收分组分发到不同的CPU队列进行并发除了而提高PPS，http://lwn.net/Articles/328339/。
 
-* `sd->input_pkt_queue`
+说明一下旧式的设备驱动指调用`netif_rx()`的设备或者`non-NAPI`设备。先来看看non-napi设备相关的字段，
+
+* `sd.input_pkt_queue`
 
 该队列仅用于non-napi设备。non-API设备会在驱动程序中（往往是中断处理函数）分配skb，从寄存器读取数据到skb，然后调用`netif_rx()`把`skb`排入`sd->input_pkt_queue`。注意，所有non-napi设备共享输入队列，即per-CPU的`sd->input_pkt_queue`。
 
-* `sd->poll_list`
+* `sd.backlog`
 
+用于non-napi设备，为了和NAPI接收架构兼容，所有的non-napi设备使用一个伪`napi_struct`，即这里的`sd.backlog`。NAPI设备把自己的napi_struct{}放入`sd->poll_list`，而所有的non-napi设备在`netif_rx`的时候把`sd->backlog`放入`sd->poll_list`。稍后看到napi架构的下半部（软中断处理）函数`net_rx_action`依次取出排列到`sd->poll_list`的`napi_struct{}`结构，并使用`napi_poll`轮询配额的数据（或不足配额的所有数据）。
 
+`sd.backlog`是一个内嵌的结构，所有non-napi设备共享它。而它的`sd.backlog.poll`(即`napi.poll`)被初始化为`process_backlog()`，通过这种“共享的伪`napi_struct{}`”方式使得non-napi设备很好的融入了NAPI框架，使得*non-napi*和*NAPI设备*对下半部（`net_rx_action()`）是透明的。不得不说，这是一个值得学习的精巧设计，让我们知道如何向前兼容旧的机制，如何让下层的变化对上层透明。
 
-> 其中的某些字段和`Receive Packet Steering(RPS)`，RPS通过将接收分组分发到不同的CPU队列进行并发除了而提高PPS。LWN链接如下http://lwn.net/Articles/328339/。
+* `sd.process_queue`
 
+刚才已经提到，non-napi设备把skb放入`sd.input_pkt_queue`，然后在下半部处理中使用`sd.backlog.poll`即`proces_backlog()`函数来处理skb。改函数模拟了NAPI驱动的poll函数行为。作为对比，NAPI设备的poll从设备私有队列读取。Non-NAPI的process_backlog()函数则从non-napi设备共享的输入队列input_pkt_queue中读取配额的数据。然后放入sd.process_queue。
 
+然后是一些通用的字段，
 
+* `sd.poll_list`
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+NAPI设备在中断处理函数中将其`napi_struct{}`放入该队列，调度软中断soft-IRQ，稍后有下半部`net_rx_action()`负责轮询该设备。
 
 <a id="napi_struct"/>
 #### New API结构: napi_struct{}
 
+> 原本可以忽略本段注释，不过考虑到ULNI使用了旧的内嵌结构`sd.backlog_dev`为了避免阅读时的误解，需要在此说明一下，该字段在2.6.12中的定义是`struct net_device backlog_dev;`。而随着`napi_struct{}`的引入而修改为此。就是说`sd.backlog.poll`原来是`sd.backlog_dev.poll`。注意，NAPI很早（在2.6.12之前）就有了，但`napi_struct{}`是新的结构。另外，net_device中原来的`dev->poll_list`, `dev->quota`, `dev->weight`也剥离到了`napi_struct{}`中集中处理。
 
-Netpoll和kgdb有关，
+
+```C++
+// include/linux/netdevice.h
+/*
+ * Structure for NAPI scheduling similar to tasklet but with weighting
+ */    
+struct napi_struct {
+    /* The poll_list must only be managed by the entity which
+     * changes the state of the NAPI_STATE_SCHED bit.  This means
+     * whoever atomically sets that bit can add this napi_struct
+     * to the per-cpu poll_list, and whoever clears that bit
+     * can remove from the list right before clearing the bit.
+     */
+    struct list_head    poll_list; 
+
+    unsigned long       state;
+    int         weight;       
+    unsigned int        gro_count; 
+    int         (*poll)(struct napi_struct *, int);
+#ifdef CONFIG_NETPOLL         
+    spinlock_t      poll_lock;
+    int         poll_owner;   
+#endif 
+    struct net_device   *dev; 
+    struct sk_buff      *gro_list; 
+    struct sk_buff      *skb; 
+    struct hrtimer      timer;
+    struct list_head    dev_list;  
+    struct hlist_node   napi_hash_node;
+    unsigned int        napi_id;   
+};
+
+enum { 
+    NAPI_STATE_SCHED,   /* Poll is scheduled */
+    NAPI_STATE_DISABLE, /* Disable pending */
+    NAPI_STATE_NPSVC,   /* Netpoll - don't dequeue from poll_list */
+    NAPI_STATE_HASHED,  /* In NAPI hash */
+};
+
+```
+
+
+
+> Netpoll和kgdb

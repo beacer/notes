@@ -1,16 +1,16 @@
-Linux Kernel之*帧的接收*
+nux Kernel之*帧的接收*
 =======================
 
 > 本文的目的是通过重读《ULNI》和目前的Kernel实现（4.x）重温网络部分帧的接收流程。虽然大部分内容都在《ULNI》中都有，毕竟2.6.12版本的Kernel已经有些年头了，书中有些地方和现在的实现会有些出入（例如`napi_struct{}`的引入，`softnet_data{}`的改变等）。借次机会再次复习复习总不会错 :-)
 
 * [Kernel和NIC的交互](#irq-poll)
 * [中断、下半部和软中断](#IRQ-BH)
-  o [硬件中断](#hardware-IRQ)
-  o [下半部](#bottom-Half)
-  o [网络代码和SoftIRQ](#net-softirq)
+  - [硬件中断](#hardware-IRQ)
+  - [下半部](#bottom-Half)
+  - [网络代码和SoftIRQ](#net-softirq)
 * [数据结构](#data-struct)
-  o [per-CPU结构：softnet_data](#softnet_data)
-  o [New API结构：napi_struct](#napi_struct)
+  - [per-CPU结构：softnet_data](#softnet_data)
+  - [New API结构：napi_struct](#napi_struct)
 
 <a id="irq-poll"/>
 ### Kernel和NIC的交互
@@ -152,10 +152,10 @@ struct softnet_data {
 
 NAPI设备在中断处理函数中将其`napi_struct{}`放入该队列，调度软中断soft-IRQ，稍后有下半部`net_rx_action()`负责轮询该设备。
 
+> 原本可以忽略本段注释，不过考虑到ULNI使用了旧的内嵌结构`sd.backlog_dev`为了避免阅读时的误解，需要在此说明一下，该字段在2.6.12中的定义是`struct net_device backlog_dev;`。而随着`napi_struct{}`的引入而修改为此。就是说`sd.backlog.poll`原来是`sd.backlog_dev.poll`。注意，NAPI很早（在2.6.12之前）就有了，但`napi_struct{}`是新的结构。另外，net_device中原来的`dev->poll_list`, `dev->quota`, `dev->weight`也剥离到了`napi_struct{}`中集中处理。
+
 <a id="napi_struct"/>
 #### New API结构: napi_struct{}
-
-> 原本可以忽略本段注释，不过考虑到ULNI使用了旧的内嵌结构`sd.backlog_dev`为了避免阅读时的误解，需要在此说明一下，该字段在2.6.12中的定义是`struct net_device backlog_dev;`。而随着`napi_struct{}`的引入而修改为此。就是说`sd.backlog.poll`原来是`sd.backlog_dev.poll`。注意，NAPI很早（在2.6.12之前）就有了，但`napi_struct{}`是新的结构。另外，net_device中原来的`dev->poll_list`, `dev->quota`, `dev->weight`也剥离到了`napi_struct{}`中集中处理。
 
 
 ```C++

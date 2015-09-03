@@ -1,11 +1,16 @@
 Linux Kernel之*帧的接收*
 =======================
 
-* [Kernel和NIC的交互](#irq-poll)
-* [中断和下半部](#bottom-Half)
-* [网络代码如何使用SoftIRQ](#net-softirq)
+> 本文的目的是通过重读《ULNI》和目前的Kernel实现（4.x）重温网络部分帧的接收流程。虽然大部分内容都在《ULNI》中都有，毕竟2.6.12版本的Kernel已经有些年头了，书中有些地方和现在的实现会有些出入（例如`napi_struct{}`的引入，`softnet_data{}`的改变等）。借次机会再次复习复习总不会错 :-)
 
-> 本文的目的是通过重读《ULNI》和最新的Kernel实现（4.x）重温网络部分帧的接收流程。因此大部分内容都在《ULNI》中都有，不过比较2.6.12版本的Kernel已经有些年头了，有些地方和现在的实现会有些出入（例如`napi_struct{}`的引入，`softnet_data{}`的改变等）。借次机会再次复习复习总不会错 :-)
+* [Kernel和NIC的交互](#irq-poll)
+* [中断、下半部和软中断](#IRQ-BH)
+  o [硬件中断](#hardware-IRQ)
+  o [下半部](#bottom-Half)
+  o [网络代码和SoftIRQ](#net-softirq)
+* [数据结构](#data-struct)
+  o [per-CPU结构：softnet_data](#softnet_data)
+  o [New API结构：napi_struct](#napi_struct)
 
 <a id="irq-poll"/>
 ### Kernel和NIC的交互
@@ -24,16 +29,19 @@ Linux Kernel之*帧的接收*
 
 一种改进的方案是在`一个中断中处理多个帧`。也就是说，当收到一个中断后检查寄存器，如果有数据则持续收取直到收完所有数据，或者达到一个给定的数目（配额）后停止，显然不能因为有数据中断处理就一直不返回。一些旧式的驱动（例如使用`netif_rx()`）的驱动采用了这个模式。
 
->一个使用这种（旧式或netif_rx()式）方案的例子是3com的3c59x.c驱动，可以参考《深入理解Linux网络技术内幕》或者直接查看源码driver/net/ethernet/3com/3c59x.c。
+>一个使用这种（旧式或netif_rx()式）方案的例子是3com的3c59x.c驱动，可以参考《ULNI》或者直接查看源码driver/net/ethernet/3com/3c59x.c。
 
-这里只需要理解此类设备如何在一次中断中处理多个帧，先不深入到vortex_rx()和netif_rx()的实现细节和输入队列等其他话题。
+这里只需要理解此类设备如何在一次中断中处理多个帧，先不深入到`vortex_rx()`和`netif_rx()`的实现细节和输入队列等其他话题。
 
 * **中断与轮询结合（NAPI）**
 
 不过更好的方式是中断和轮询的组合（称为New-API，napi方式）。NIC检测到有数据接收通过中断通知Kernel，中断处理函数并不分配skb和读取数据帧，而是将设备（早期是`net_devivce{}`本身现在是相关的napi_struct{}）排入队列，然后触发`下半部（bottom-half，BH)`（例如软中断），由下半部异步的方式负责轮询设备一次读取完所有数据或到达配额上限。
 
-<a id="bottom-Half"/>
-### 中断和下半部（Bottom-Half）
+<a id="IRQ-BH"/>
+### 中断、下半部和软中断
+
+<a id="hardware-IRQ"/>
+#### 硬件中断
 
 我们知道中断是为了及时响应外部事件，而一旦处于*中断上下文（interrupt context）*中，
 
@@ -41,6 +49,9 @@ Linux Kernel之*帧的接收*
 * CPU也不能执行其他的进程
 
 总之，（硬）中断是不能被抢占的（nonpreemptible），也是不可重入的（non-reentrant），这样就能降低竞争条件的发生；这同时也意味着，中断处理函数的工作应该尽快完成。
+
+<a id="bottom-Half"/>
+#### 下半部（Bottom-Half，BH）
 
 于是中断处理过程被分为“上半部top-half”和“下半部bottom-half”，上半部在中断上下文中执行，下半部则“以异步的方式完成特定的请求”。这样就能把硬中断关闭的时间大幅减少，避免因为上半部执行时间过长而丢失任何数据和信息。
 
@@ -55,12 +66,102 @@ Linux Kernel之*帧的接收*
 
 软中断和微任务都是通过softirq框架实现，它们在并发和上锁上有一些差异，而且软中断的数目（类型）是设计编码时决定的（如`HI_SOFTIRQ`，`NET_RX_SOFTIRQ`等）；微任务基于软中断实现，但可以动态添加不同的task。软中断（包括tasklet）所执行的机会有很多，例如，
 
-* 硬中断处理函数(do_IRQ)的末尾，重新打开CPU的中断后，会执行Pending的软中断，这也意味着软中断是可以被硬中断所抢占的。
-* 从中断和异常事件，系统调用返回
-* 内核线程run_ksoftirqd() - 如果其他地方都没机会，至少会在这执行软中断。
+1. 硬中断处理函数(do_IRQ)的末尾，重新打开CPU的中断后，会执行Pending的软中断，这也意味着软中断是可以被硬中断所抢占的。
+2. 从中断和异常事件，系统调用返回
+3. 在CPU上重新打开软中断
+4. 内核线程`run_ksoftirqd()`。如果其他地方都没机会，至少会在这执行一把（也算是兜底？）。命令`ps -e | grep softirq`可以找到per-CPU的softirq线程。
 
 >考虑到主题是帧的接收以及篇幅限制，软中断和其他下半部的话题可参考《ULNI》《LDD3》等。
 
 <a id="net-softirq"/>
-### 网络代码如何使用SoftIRQ
+### 网络代码和SoftIRQ
 
+网络子系统的初始化函数`net_dev_init()`会“注册”两个网络相关的软中断，一个用于发送处理，一个用于接收。
+
+```c++
+static int __init net_dev_init(void)
+{
+    ... ...
+    open_softirq(NET_TX_SOFTIRQ, net_tx_action);
+    open_softirq(NET_RX_SOFTIRQ, net_rx_action);
+    ... ...
+}
+```
+
+> `net_dev_init()`在系统初始化（boot）期间被调用，系统初始化和宏`subsys_initcall`相关的议题见《ULNI》。
+
+<a id="data-struct"/>
+### 数据结构
+
+<a id="softnet_data"/>
+#### per-CPU结构： softnet_data{}
+
+网络数据接收中一个非常重要的数据结构是per-CPU变量`softnet_data{}`，简称`sd`。使用Per-CPU变量可以避免上锁提高并发率和吞吐量。新版的`sd`比ULNI中的定义（2.6.12版本内核）复杂了不少，
+
+```c++
+// net/core/dev.c
+
+DEFINE_PER_CPU_ALIGNED(struct softnet_data, softnet_data);
+
+// include/linux/netdevice.h
+
+struct softnet_data {
+    struct list_head    poll_list;     // 需要ingress轮询的dev列表，“设备”用相关的napi_struct表示
+    struct sk_buff_head process_queue; // 旧式积压队列 netif_rx()对应的process_backlog，
+                                       // skb从sd->input_pkt_queue装异到此处，再进行收取
+
+    /* stats */
+    unsigned int        processed;
+    unsigned int        time_squeeze;
+    unsigned int        cpu_collision;
+    unsigned int        received_rps;
+    ... RPS和Net FLOW ...
+    struct Qdisc        *output_queue;
+    struct Qdisc        **output_queue_tailp;
+    struct sk_buff      *completion_queue;
+    
+#ifdef CONFIG_RPS
+    ... ...
+#endif
+    unsigned int        dropped;         // 丢包统计，例如队列已满
+    struct sk_buff_head input_pkt_queue; // 用于Non-NAPI设备，驱动分配skb，读取数据，把skb放入该队列
+    struct napi_struct  backlog;         // 用于Non-NAPI设备，2.6.12时是 struct net_device backlog_dev;
+    
+};  
+```
+
+先说明一下，旧式的设备驱动指调用`netif_rx()`的设备或者`non-NAPI`设备。
+
+* `sd->input_pkt_queue`
+
+该队列仅用于non-napi设备。non-API设备会在驱动程序中（往往是中断处理函数）分配skb，从寄存器读取数据到skb，然后调用`netif_rx()`把`skb`排入`sd->input_pkt_queue`。注意，所有non-napi设备共享输入队列，即per-CPU的`sd->input_pkt_queue`。
+
+* `sd->poll_list`
+
+
+
+> 其中的某些字段和`Receive Packet Steering(RPS)`，RPS通过将接收分组分发到不同的CPU队列进行并发除了而提高PPS。LWN链接如下http://lwn.net/Articles/328339/。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<a id="napi_struct"/>
+#### New API结构: napi_struct{}
+
+
+Netpoll和kgdb有关，

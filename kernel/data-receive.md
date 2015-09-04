@@ -10,7 +10,11 @@ Linux Kernel之*帧的接收*
   - [网络代码和SoftIRQ](#net-softirq)
 * [数据结构](#data-struct)
   - [per-CPU结构：softnet_data](#softnet_data)
+  - [softnet_data初始化](#sd-init)
   - [New API结构：napi_struct](#napi_struct)
+* [使用NAPI的设备](#napi)
+* [使用netif_rx的设备（Non-NAPI）](#non-napi)
+* [下半部：net_rx_action](#net_rx_action)
 
 <a id="irq-poll"/>
 ### Kernel和NIC的交互
@@ -152,11 +156,37 @@ struct softnet_data {
 
 NAPI设备在中断处理函数中将其`napi_struct{}`放入该队列，调度软中断soft-IRQ，稍后有下半部`net_rx_action()`负责轮询该设备。
 
-> 原本可以忽略本段注释，不过考虑到ULNI使用了旧的内嵌结构`sd.backlog_dev`为了避免阅读时的误解，需要在此说明一下，该字段在2.6.12中的定义是`struct net_device backlog_dev;`。而随着`napi_struct{}`的引入而修改为此。就是说`sd.backlog.poll`原来是`sd.backlog_dev.poll`。注意，NAPI很早（在2.6.12之前）就有了，但`napi_struct{}`是新的结构。另外，net_device中原来的`dev->poll_list`, `dev->quota`, `dev->weight`也剥离到了`napi_struct{}`中集中处理。
+> 原本可以忽略本段注释，不过考虑到ULNI使用了旧的内嵌结构`sd.backlog_dev`为了避免阅读时的误解，需要在此说明一下，该字段在2.6.12中的定义是`struct net_device backlog_dev;`。而随着`napi_struct{}`的引入而修改为此。就是说`sd.backlog.poll`原来是`sd.backlog_dev.poll`。
+
+<a id="sd-init"/>
+#### softnet_data初始化
+
+per-CPU数据`softnet_data`也在`net_dev_init()`中初始化，注意non-napi使用的`sd.backlog`的初始化设置了统一的poll函数`process_backlog`和配额。
+
+```c++
+static int __init net_dev_init(void)
+{
+    ... ...
+    for_each_possible_cpu(i) {
+        struct softnet_data *sd = &per_cpu(softnet_data, i);
+
+        skb_queue_head_init(&sd->input_pkt_queue);
+        skb_queue_head_init(&sd->process_queue);
+        INIT_LIST_HEAD(&sd->poll_list);
+        sd->output_queue_tailp = &sd->output_queue;
+        ... RPS ...
+
+        sd->backlog.poll = process_backlog;
+        sd->backlog.weight = weight_p;
+    } 
+    ... ...   
+}
+```
 
 <a id="napi_struct"/>
 #### New API结构: napi_struct{}
 
+虽然NAPI很早就已经引入了Kernel，近来kernel将NAPI部分又进行了一定的抽象，定义了`napi_struct{}`。net_device中原来的`dev->poll_list`, `dev->quota`, `dev->weight`也剥离到了`napi_struct{}`中集中处理。
 
 ```C++
 // include/linux/netdevice.h
@@ -170,16 +200,13 @@ struct napi_struct {
      * to the per-cpu poll_list, and whoever clears that bit
      * can remove from the list right before clearing the bit.
      */
-    struct list_head    poll_list; 
+    struct list_head    poll_list;     // sd->poll_list元素
 
-    unsigned long       state;
-    int         weight;       
+    unsigned long       state;         // NAPI_STATE_XXX
+    int         weight;                // 每个NAPI实体试用的配额
     unsigned int        gro_count; 
     int         (*poll)(struct napi_struct *, int);
-#ifdef CONFIG_NETPOLL         
-    spinlock_t      poll_lock;
-    int         poll_owner;   
-#endif 
+    ... netpoll ...
     struct net_device   *dev; 
     struct sk_buff      *gro_list; 
     struct sk_buff      *skb; 
@@ -198,6 +225,45 @@ enum {
 
 ```
 
+> NETPOLL则提供了紧急情况下使用通过硬件polling的方式使用网络设备，可以使用它实现netconsole, kgdb-over-ethernet等。
+
+<a id="napi"/>
+#### 使用NAPI的设备
+
+我们从一个例子查看NIC如何使用NAPI进行帧的接收。Intel的ethernet驱动e100之前使用的是non-API的方式，现在已经完全支持了NAPI。帧的接收从NIC的中断开始，中断处理函数在中断上下文运行，此时（硬）中断会被关闭。e100的中断处理函数为`e100_intr()`。
+
+e100设备被打开的时候e100_open()被调用，进而调用e100_up()。后者会安装中断处理函数
+
+```
+static int e100_up(struct nic *nic)
+{
+    int err;
+
+    if ((err = e100_rx_alloc_list(nic)))
+        return err;
+    if ((err = e100_alloc_cbs(nic)))
+        goto err_rx_clean_list;        
+    if ((err = e100_hw_init(nic))) 
+        goto err_clean_cbs;   
+    e100_set_multicast_list(nic->netdev);
+    e100_start_receiver(nic, NULL);
+    mod_timer(&nic->watchdog, jiffies);
+    if ((err = request_irq(nic->pdev->irq, e100_intr, IRQF_SHARED,
+        nic->netdev->name, nic->netdev)))
+        goto err_no_irq;
+    netif_wake_queue(nic->netdev); 
+    napi_enable(&nic->napi);  
+    /* enable ints _after_ enabling poll, preventing a race between
+     * disable ints+schedule */
+    e100_enable_irq(nic);
+    return 0;
+    ... ...
+}
+```
 
 
-> Netpoll和kgdb
+<a id="non-napi"/>
+#### 使用netif_rx的设备（Non-NAPI）
+
+<a id="net_rx_action"/>
+#### 下半部：net_rx_action

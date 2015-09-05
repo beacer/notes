@@ -13,9 +13,11 @@ Linux Kernel之*帧的接收*
   - [softnet_data初始化](#sd-init)
   - [New API结构：napi_struct](#napi_struct)
 * [NAPI框架和新、旧驱动程序](#napi-framework)
+  - [NAPI的API](#napi-api)
 * [下半部：net_rx_action](#net_rx_action)
 * [使用NAPI的设备](#napi-dev)
 * [使用netif_rx的设备（Non-NAPI）](#non-napi-dev)
+* [入口帧的处理：netif_receive_skb](#netif_receive_skb)
 
 <a id="irq-poll"/>
 ### Kernel和NIC的交互
@@ -228,20 +230,63 @@ enum {
 
 > NETPOLL则提供了紧急情况下使用通过硬件polling的方式使用网络设备，可以使用它实现netconsole, kgdb-over-ethernet等。
 
-<a id="napi-framework"/>
-#### NAPI框架和新、旧驱动程序
+两个概念要提一下：`预算（buget）`和`权重（weight）`。`预算`代表了所有要轮询的设备，在一次软件中断中，总共能够处理的帧的输入；限制预算的原因是放在软中断占用CPU时间过长而影响其他进程和软中断（硬件中断不受影响）。除了现在总预算外，为了公平起见，对每个设备也需要分配一定的`权重（weight）`，限制每个设备最大的帧读取量。之前版本的Kernel还有个`配额（quota）`的概念，那时配额代表了设备能够一次性读取的最多帧，而权重（weight）只是quota的增幅。新版的Kernel则直接使用weight。
 
-ULNI的一张图很好的诠释了NAPI框架和新、旧驱动程序直接的关系。
+> 之前已经提到过，最早引入NAPI（Kernel 2.5）的时候，在`net_device{}`加入了`poll`, `poll_list`, `quota`, `weight`几个字段，随着后来`napi_struct{}`的引入，现在它们都被移动到了`napi_struct{}`中（quota被去除了）。
+
+<a id="napi-framework"/>
+### NAPI框架和新、旧驱动程序
+
+ULNI的一张图很好的诠释了NAPI框架和新、旧驱动程序直接的关系。不过新版的Kernel更新了一些napi相关函数，netif_rx()实现也和以前有很大不同。
 
 <div align=center><img src="images/napi_nonnapi_drivers.jpg" width="" height="" alt="bridge device"/></div>
 
+<a id="napi-api"/>
+#### NAPI的API
+
+先来看看NAPI系列API，
+
+* `napi_schedule/____napi_schedule`
+
+`napi_schedule`完成RX的调度工作，它原来叫做`netif_rx_schedule`，而它是____napi_schedule()的包裹函数。函数`____napi_schedule()`（原来叫做`__netif_rx_schedule()`）。它的作用是，
+
+1. 把`napi设备`的`napi`结构（对于non-napi设备则是`sd->backlog`）放入设备轮询队列：`sd->poll_list`。
+2. 调度软中断NET_RX_SOFTIRQ
+
+如图上所示，NAPI设备驱动一般会直接调用该函数（或变体），而non-napi设备则是通过netif_rx()来调用它。
+
+* `napi_complete/__napi_complete`
+
+当设备驱动（sd->poll，例如e100_poll）完成了对所有接收数据的轮询，就需要把设备（的napi）从sd->poll_list移除，移除过程通过napi_complete或其变体。
+
+* `netif_napi_add`
+
+NAPI驱动程序调用该函数设置自己的poll，和权重，此外该函数会初始化设备的napi_struct包括state等。
+
+```c++
+void netif_napi_add(struct net_device *dev, struct napi_struct *napi,
+            int (*poll)(struct napi_struct *, int), int weight)
+{
+    INIT_LIST_HEAD(&napi->poll_list);
+    ... ...
+    napi->timer.function = napi_watchdog;
+    ... ...
+    napi->skb = NULL;
+    napi->poll = poll;
+    if (weight > NAPI_POLL_WEIGHT)  // 权重的设置不能过大
+        pr_err_once("netif_napi_add() called with weight %d on device %s\n",
+                weight, dev->name);            
+    napi->weight = weight;    
+    list_add(&napi->dev_list, &dev->napi_list);
+    napi->dev = dev;
+    ... ...
+    set_bit(NAPI_STATE_SCHED, &napi->state);
+}
+
+```
 
 <a id="net_rx_action"/>
-#### 下半部：net_rx_action
-
-先提一下两个概念`预算（buget）`和`权重（weight）`。`预算`代表了所有要轮询的设备，在一次软件中断中，总共能够处理的帧的输入；限制预算的原因是放在软中断占用CPU时间过长而影响其他进程和软中断（硬件中断不受影响）。除了现在总预算外，为了公平起见，对每个设备也需要分配一定的`权重（weight）`，限制每个设备最大的帧读取量。之前版本的Kernel还有个`配额（quota）`的概念，那时配额代表了设备能够一次性读取的最多帧，而权重（weight）只是quota的增幅。新版的Kernel则直接使用weight。
-
-> 之前已经提到过，最早引入NAPI（Kernel 2.5）的时候，在`net_device{}`加入了`poll`, `poll_list`, `quota`, `weight`几个字段，随着后来`napi_struct{}`的引入，现在它们都被移动到了`napi_struct{}`中（quota被去除了）。
+### 下半部：net_rx_action
 
 `net_rx_action`是软中断`NET_RX_SOFTIRQ`的处理函数。它把`sd->poll_list`中所有设备（对应的napi结构）取出来，依次处理。如果因为总预算超过而未能被轮询的设备，其`napi`结构要重新被加入`sd->poll_list`尾端。此外还有一种情况，就是设备本身的权重被用完了，它们也要再次被加入`sd->poll_list`等待下次`NET_RX_SOFTIRQ`被调度。
 
@@ -303,9 +348,8 @@ static void net_rx_action(struct softirq_action *h)
 }
 
 ```
-
 <a id="napi-dev"/>
-#### 使用NAPI的设备
+### 使用NAPI的设备
 
 我们从一个例子查看NIC如何使用NAPI进行帧的接收。Intel的ethernet驱动e100之前使用的是non-API的方式，现在已经完全支持了NAPI。帧的接收从NIC的中断开始，中断处理函数在中断上下文运行，此时（硬）中断会被关闭。e100的中断处理函数为`e100_intr()`。
 
@@ -340,6 +384,9 @@ static int e100_up(struct nic *nic)
 
 
 <a id="non-napi-dev"/>
-#### 使用netif_rx的设备（Non-NAPI）
+### 使用netif_rx的设备（Non-NAPI）
 
+
+<a id="netif_receive_skb/>
+### Ingress帧的处理：netif_receive_skb
 

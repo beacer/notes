@@ -12,9 +12,10 @@ Linux Kernel之*帧的接收*
   - [per-CPU结构：softnet_data](#softnet_data)
   - [softnet_data初始化](#sd-init)
   - [New API结构：napi_struct](#napi_struct)
-* [使用NAPI的设备](#napi)
-* [使用netif_rx的设备（Non-NAPI）](#non-napi)
+* [NAPI框架和新、旧驱动程序](#napi-framework)
 * [下半部：net_rx_action](#net_rx_action)
+* [使用NAPI的设备](#napi-dev)
+* [使用netif_rx的设备（Non-NAPI）](#non-napi-dev)
 
 <a id="irq-poll"/>
 ### Kernel和NIC的交互
@@ -227,7 +228,83 @@ enum {
 
 > NETPOLL则提供了紧急情况下使用通过硬件polling的方式使用网络设备，可以使用它实现netconsole, kgdb-over-ethernet等。
 
-<a id="napi"/>
+<a id="napi-framework"/>
+#### NAPI框架和新、旧驱动程序
+
+ULNI的一张图很好的诠释了NAPI框架和新、旧驱动程序直接的关系。
+
+<div align=center><img src="images/napi_nonnapi_drivers.jpg" width="" height="" alt="bridge device"/></div>
+
+
+<a id="net_rx_action"/>
+#### 下半部：net_rx_action
+
+先提一下两个概念`预算（buget）`和`权重（weight）`。`预算`代表了所有要轮询的设备，在一次软件中断中，总共能够处理的帧的输入；限制预算的原因是放在软中断占用CPU时间过长而影响其他进程和软中断（硬件中断不受影响）。除了现在总预算外，为了公平起见，对每个设备也需要分配一定的`权重（weight）`，限制每个设备最大的帧读取量。之前版本的Kernel还有个`配额（quota）`的概念，那时配额代表了设备能够一次性读取的最多帧，而权重（weight）只是quota的增幅。新版的Kernel则直接使用weight。
+
+> 之前已经提到过，最早引入NAPI（Kernel 2.5）的时候，在`net_device{}`加入了`poll`, `poll_list`, `quota`, `weight`几个字段，随着后来`napi_struct{}`的引入，现在它们都被移动到了`napi_struct{}`中（quota被去除了）。
+
+`net_rx_action`是软中断`NET_RX_SOFTIRQ`的处理函数。它把`sd->poll_list`中所有设备（对应的napi结构）取出来，依次处理。如果因为总预算超过而未能被轮询的设备，其`napi`结构要重新被加入`sd->poll_list`尾端。此外还有一种情况，就是设备本身的权重被用完了，它们也要再次被加入`sd->poll_list`等待下次`NET_RX_SOFTIRQ`被调度。
+
+最后，不论是总预算还是某些设备weight耗尽的关系，本次执行未能完成所有设备及其所有数据的接收，需要重新调度`NET_RX_SOFTIRQ`。
+
+```c++
+static void net_rx_action(struct softirq_action *h)
+{
+    struct softnet_data *sd = this_cpu_ptr(&softnet_data);
+    unsigned long time_limit = jiffies + 2; 
+    int budget = netdev_budget;
+    LIST_HEAD(list);   // 待轮询的所有设备，包括了预算用完后未被轮询到的设备
+    LIST_HEAD(repoll); // 记录那些因为自己的权重配额被而需要下次轮询的设备。
+
+    // 先把所有设备(napi)从poll队列中取出来，如果buget超限，剩下的设备会再次放入尾端。
+    local_irq_disable();
+    list_splice_init(&sd->poll_list, &list);
+    local_irq_enable();
+
+    // 遍历每个设备的napi，直到所有设备都处理完，或者预算用完
+    for (;;) {
+        struct napi_struct *n;
+
+        if (list_empty(&list)) {
+            if (!sd_has_rps_ipi_waiting(sd) && list_empty(&repoll))
+                return;
+            break;
+        }    
+
+        n = list_first_entry(&list, struct napi_struct, poll_list);
+        budget -= napi_poll(n, &repoll); // 由设备的->poll自己确认是不是数据已经全部读取或者权重用完了
+
+        // 预算已经用完了
+        /* If softirq window is exhausted then punt.
+         * Allow this to run for 2 jiffies since which will allow
+         * an average latency of 1.5/HZ.
+         */
+        if (unlikely(budget <= 0 || 
+                 time_after_eq(jiffies, time_limit))) {
+            sd->time_squeeze++;
+            break;
+        }    
+    }    
+
+    local_irq_disable();
+
+    // 以下设备要重新被放入sd->poll_list
+    // 1. 因为预算用完，list中尚未处理的设备，
+    // 2. 或者设备本身权重用完而被放入repoll的设备
+    list_splice_tail_init(&sd->poll_list, &list);
+    list_splice_tail(&repoll, &list);
+    list_splice(&list, &sd->poll_list);
+
+    // 不论是总预算还是设备weight的关系，本次执行未能完成所有设备及其所有数据的接收，重新调度NET_RX_SOFTIRQ
+    if (!list_empty(&sd->poll_list))
+        __raise_softirq_irqoff(NET_RX_SOFTIRQ);
+
+    net_rps_action_and_irq_enable(sd);
+}
+
+```
+
+<a id="napi-dev"/>
 #### 使用NAPI的设备
 
 我们从一个例子查看NIC如何使用NAPI进行帧的接收。Intel的ethernet驱动e100之前使用的是non-API的方式，现在已经完全支持了NAPI。帧的接收从NIC的中断开始，中断处理函数在中断上下文运行，此时（硬）中断会被关闭。e100的中断处理函数为`e100_intr()`。
@@ -262,8 +339,7 @@ static int e100_up(struct nic *nic)
 ```
 
 
-<a id="non-napi"/>
+<a id="non-napi-dev"/>
 #### 使用netif_rx的设备（Non-NAPI）
 
-<a id="net_rx_action"/>
-#### 下半部：net_rx_action
+

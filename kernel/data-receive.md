@@ -13,7 +13,8 @@ Linux Kernel之*帧的接收*
   - [softnet_data初始化](#sd-init)
   - [New API结构：napi_struct](#napi_struct)
 * [NAPI框架和新、旧驱动程序](#napi-framework)
-  - [NAPI的API](#napi-api)
+  - [NAPI相关函数](#napi-api)
+  - [netif_rx函数](#netif_rx)
 * [下半部：net_rx_action](#net_rx_action)
 * [使用NAPI的设备](#napi-dev)
 * [使用netif_rx的设备（Non-NAPI）](#non-napi-dev)
@@ -263,7 +264,7 @@ ULNI的一张图很好的诠释了NAPI框架和新、旧驱动程序直接的关
 
 NAPI驱动程序调用该函数设置自己的poll，和权重，此外该函数会初始化设备的napi_struct包括state等。
 
-```c++
+```C++
 void netif_napi_add(struct net_device *dev, struct napi_struct *napi,
             int (*poll)(struct napi_struct *, int), int weight)
 {
@@ -281,6 +282,56 @@ void netif_napi_add(struct net_device *dev, struct napi_struct *napi,
     napi->dev = dev;
     ... ...
     set_bit(NAPI_STATE_SCHED, &napi->state);
+}
+```
+
+<a id="netif_rx"/>
+#### netif_rx函数
+
+不考虑RPS，netif_rx函数的工作最终由`enqueue_to_backlog`完成。后者的逻辑非常简单，
+
+1. 如果设备的输入队列未被开启（通过测试dev.state是否设置__LINK_STATE_START，输入没有特定的标记）
+1. 如果队列中没有其他数据，先通过`____napi_schedule()`调度NAPI（把`sd.backlog`放入`sd.poll_list`然后调度SoftIRQ）
+2. 把skb放入`sd.input_pkt_queue`尾部（在队列未满或者流控允许的情况下）
+
+队列为空要先调度SoftIRQ的原因是，这时non-api共享的`sd.backlog`可能都不在`sd.poll_list`中。因为netif_rx()的执行环境是中断上下文，调度SoftIRQ后它不会被立即执行。
+
+```c++
+static int enqueue_to_backlog(struct sk_buff *skb, int cpu, 
+                  unsigned int *qtail)
+{
+    ... ...
+    sd = &per_cpu(softnet_data, cpu);
+
+    local_irq_save(flags);
+
+    rps_lock(sd);
+    if (!netif_running(skb->dev))
+        goto drop;
+    qlen = skb_queue_len(&sd->input_pkt_queue);
+    if (qlen <= netdev_max_backlog && !skb_flow_limit(skb, qlen)) {
+        if (qlen) {
+enqueue:
+            __skb_queue_tail(&sd->input_pkt_queue, skb);
+            input_queue_tail_incr_save(sd, qtail);
+            rps_unlock(sd);
+            local_irq_restore(flags);
+            return NET_RX_SUCCESS;
+        }    
+
+        /* Schedule NAPI for backlog device
+         * We can use non atomic operation since we own the queue lock
+         */
+        if (!__test_and_set_bit(NAPI_STATE_SCHED, &sd->backlog.state)) {
+            if (!rps_ipi_queued(sd))
+                ____napi_schedule(sd, &sd->backlog);
+        }    
+        goto enqueue;
+    }    
+
+drop:
+    ... ...
+    return NET_RX_DROP;
 }
 
 ```

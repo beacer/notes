@@ -17,6 +17,9 @@ Linux Kernel之*帧的接收*
   - [netif_rx函数](#netif_rx)
 * [下半部：net_rx_action](#net_rx_action)
 * [使用NAPI的设备](#napi-dev)
+  - [e100初始化和打开](#e100-init-open)
+  - [e100中断处理函数](#e100-intr)
+  - [e100的轮询](#e100-poll)
 * [使用netif_rx的设备（Non-NAPI）](#non-napi-dev)
 * [入口帧的处理：netif_receive_skb](#netif_receive_skb)
 
@@ -262,7 +265,7 @@ ULNI的一张图很好的诠释了NAPI框架和新、旧驱动程序直接的关
 
 * `netif_napi_add`
 
-NAPI驱动程序调用该函数设置自己的poll，和权重，此外该函数会初始化设备的napi_struct包括state等。
+NAPI驱动程序调用该函数设置自己的poll，和权重，此外该函数会初始化设备的napi_struct包括state等。NIC驱动调用该函数的时候，它会把NIC的napi结构放入dev.napi_list以备使用，注意不是放入sd.poll_list那是有数据要轮询才使用的设备列表。
 
 ```C++
 void netif_napi_add(struct net_device *dev, struct napi_struct *napi,
@@ -288,6 +291,7 @@ void netif_napi_add(struct net_device *dev, struct napi_struct *napi,
 <a id="netif_rx"/>
 #### netif_rx函数
 
+`netif_rx()`在中断上下文中执行，因此它执行期间关闭CPU的中断，工作完成重新打开。新版的netif_rx实现相对以前简化了许多，尤其是`netif_rx()`不再有拥塞管理部分。
 不考虑RPS，netif_rx函数的工作最终由`enqueue_to_backlog`完成。后者的逻辑非常简单，
 
 1. 如果设备的输入队列未被开启（通过测试dev.state是否设置__LINK_STATE_START，输入没有特定的标记）
@@ -402,37 +406,96 @@ static void net_rx_action(struct softirq_action *h)
 <a id="napi-dev"/>
 ### 使用NAPI的设备
 
-我们从一个例子查看NIC如何使用NAPI进行帧的接收。Intel的ethernet驱动e100之前使用的是non-API的方式，现在已经完全支持了NAPI。帧的接收从NIC的中断开始，中断处理函数在中断上下文运行，此时（硬）中断会被关闭。e100的中断处理函数为`e100_intr()`。
+ULNI提到那个时代使用NAPI的驱动并不多，但现在情况已经不同了。除了新驱动使用NAPI，原本使用netif_rx的Intel e100也加入了NAPI的阵营。我们以e100为例看看NAPI设备帧的接收过程。帧的接收从NIC的中断开始，中断处理函数在中断上下文运行。e100的中断处理函数为`e100_intr()`。
 
-e100设备被打开的时候e100_open()被调用，进而调用e100_up()。后者会安装中断处理函数
+<a id="e100-init-open"/>
+#### e100初始化和打开
 
-```
-static int e100_up(struct nic *nic)
+我们只关注e100初始化过程中和数据接收相关的部分，主要是NAPI和中断处理函数部分。PCI和网络设备初始化和网络设备打开等详细讨论见ULNI。
+
+e100是PCI 网卡，网络设备包括e100的驱动，以Kernel模块方式编写。模块初始化（链接到Kernel或者动态加载）的时候，注册PCI driver，当PCI自动扫描到设备的时候driver的probe函数，也就是e100_probe就会被调用。e100_probe()分配net_device{}，注册网络设备。同时也会注册napi.poll，设置权重，netif_napi_add会初始化相关的napi结构设置相应字段，并将其加入&dev->napi_list待稍后使用，之前已经提到过了。
+
+```c++
+static int e100_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 {
-    int err;
+    ... ...
+    netif_napi_add(netdev, &nic->napi, e100_poll, E100_NAPI_WEIGHT);
+}
+```
 
-    if ((err = e100_rx_alloc_list(nic)))
-        return err;
-    if ((err = e100_alloc_cbs(nic)))
-        goto err_rx_clean_list;        
-    if ((err = e100_hw_init(nic))) 
-        goto err_clean_cbs;   
-    e100_set_multicast_list(nic->netdev);
-    e100_start_receiver(nic, NULL);
-    mod_timer(&nic->watchdog, jiffies);
+另一方面使用设备前要打开该设备，用户通过ifconfig或ip命令打开一个设备时dev_open()被调用，它会设置IFF_UP和然后通过NotifyChain通告Kernel的其他模块（或者通过netlink通知应用层）。dev_open会调用dev.ndo_open()。对于e100而言则是e100_probe时注册的e100_open()。e100_open进而调用e100_up()。后者会安装中断处理函数e100_intr()。
+
+```c++
+static int e100_up(struct nic *nic)
+{       
+    ... ...
+    if ((err = e100_hw_init(nic)))
+        goto err_clean_cbs;
+    ... ...
     if ((err = request_irq(nic->pdev->irq, e100_intr, IRQF_SHARED,
         nic->netdev->name, nic->netdev)))
         goto err_no_irq;
-    netif_wake_queue(nic->netdev); 
-    napi_enable(&nic->napi);  
+    netif_wake_queue(nic->netdev);
+    napi_enable(&nic->napi);
     /* enable ints _after_ enabling poll, preventing a race between
      * disable ints+schedule */
     e100_enable_irq(nic);
     return 0;
     ... ...
 }
+
 ```
 
+<a id="e100-intr"/>
+#### e100中断处理函数
+
+e100的中断处理函数e100_intr()。
+
+1. 现实读取状态寄存器
+2. 因为中断是共享的，所有共享中断的驱动要判断中断是否是自己的，这点通过寄存器判断
+3. 写寄存器应答中断（清除中断）
+4. 如果可以的话，使用__napi_schedule调度NAPI，它把e100的napi结构&nic->napi放入sd.poll_list然后调度软中断
+5. 在下半部处理完本设备的poll前关闭中断。
+
+NIC中断的关闭不会导致数据丢失，因为数据会被保存到NIC的私有队列中，只是关闭中断不会通知CPU调用处理函数；但是下半部还是会通过轮询的方式把数据从NIC队列中读出。
+
+> NIC一般会有一个FIFO队列，可通过读寄存器或者DMA方式从该队列把数据取出。
+
+稍后NET_RX_SOFTIRQ的处理函数net_rx_action会调用e100的poll函数，
+
+```
+static irqreturn_t e100_intr(int irq, void *dev_id)
+{
+    struct net_device *netdev = dev_id;
+    struct nic *nic = netdev_priv(netdev);
+    u8 stat_ack = ioread8(&nic->csr->scb.stat_ack);
+
+    netif_printk(nic, intr, KERN_DEBUG, nic->netdev,
+             "stat_ack = 0x%02X\n", stat_ack);
+
+    if (stat_ack == stat_ack_not_ours ||    /* Not our interrupt */
+       stat_ack == stat_ack_not_present)    /* Hardware is ejected */
+        return IRQ_NONE;
+
+    /* Ack interrupt(s) */
+    iowrite8(stat_ack, &nic->csr->scb.stat_ack);
+
+    /* We hit Receive No Resource (RNR); restart RU after cleaning */
+    if (stat_ack & stat_ack_rnr)
+        nic->ru_running = RU_SUSPENDED;
+
+    if (likely(napi_schedule_prep(&nic->napi))) {
+        e100_disable_irq(nic);
+        __napi_schedule(&nic->napi);
+    }    
+
+    return IRQ_HANDLED;
+}
+
+```
+
+<a id="e100-poll"/>
+#### e100的轮询
 
 <a id="non-napi-dev"/>
 ### 使用netif_rx的设备（Non-NAPI）
@@ -440,4 +503,5 @@ static int e100_up(struct nic *nic)
 
 <a id="netif_receive_skb/>
 ### Ingress帧的处理：netif_receive_skb
+
 

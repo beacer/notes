@@ -652,7 +652,7 @@ static int process_backlog(struct napi_struct *napi, int quota)
 }
 ```
 
-<a id="netif_receive_skb/>
+<a id="netif_receive_skb"/>
 ### Ingress帧的处理：netif_receive_skb
 
 不论是NAPI NIC自己实现的poll函数（例如e100_poll/e100_rx_indicate）还是non-napi统一使用的process_backlog()，最终，它们都会调用netif_receive_skb完成接收过程最后的处理。netif_receive_skb只是__netif_receive_skb的包裹函数，后者又是__netif_receive_skb_core的包裹函数。它是一个很长的函数，也是Ingress处理最后的阶段，弄清了它能帮助我们了解，

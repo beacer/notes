@@ -524,7 +524,7 @@ NIC中断的关闭不会导致数据丢失，因为数据会被保存到NIC的�
 
 稍后NET_RX_SOFTIRQ的处理函数net_rx_action会调用e100的poll函数，
 
-```
+```C++
 static irqreturn_t e100_intr(int irq, void *dev_id)
 {
     struct net_device *netdev = dev_id;
@@ -560,7 +560,7 @@ static irqreturn_t e100_intr(int irq, void *dev_id)
 
 调用`napi.poll`函数时指定预算buget（在`net_rx_action/napi_poll`阶段指widget），认为完成后函数返实际完成量。如果**没有**完成了所有指定的工作量，意味着NIC私有队列（FIFO）中已经没有数据了。此时就会调用`napi_complete`把自己的napi结构从`sd.poll_list`退出；同时打开NIC的中断，等有新数据后通知Kernel（之前已经提到，关闭中断并不会阻止NIC接收数据到私有的FIFO。
 
-```c
+```c++
 static int e100_poll(struct napi_struct *napi, int budget)
 {
     struct nic *nic = container_of(napi, struct nic, napi);
@@ -594,7 +594,7 @@ netif_rx()之前已经详细了解过了，它把共享的sd.backlog放入sd.pol
 
 > 用两个queue的原因是和锁有关么？
 
-```c
+```c++
 static int process_backlog(struct napi_struct *napi, int quota)
 {
     int work = 0;
@@ -655,9 +655,14 @@ static int process_backlog(struct napi_struct *napi, int quota)
 <a id="netif_receive_skb/>
 ### Ingress帧的处理：netif_receive_skb
 
-不论是NAPI的poll函数（例如e100_poll/e100_rx_indicate）还是non-napi使用的process_backlog()，最终，都会调用netif_receive_skb完成接收过程最后的处理。netif_receive_skb只是__netif_receive_skb的包裹函数，后者又是__netif_receive_skb_core的包裹函数。
+不论是NAPI NIC自己实现的poll函数（例如e100_poll/e100_rx_indicate）还是non-napi统一使用的process_backlog()，最终，它们都会调用netif_receive_skb完成接收过程最后的处理。netif_receive_skb只是__netif_receive_skb的包裹函数，后者又是__netif_receive_skb_core的包裹函数。它是一个很长的函数，也是Ingress处理最后的阶段，弄清了它能帮助我们了解，
 
-```c
+1. 如何将skb从L2向L3递交；
+2. 虚拟设备，如VLAN、Bridge设备实现。
+
+
+
+```c++
 static int __netif_receive_skb_core(struct sk_buff *skb, bool pfmemalloc)
 {
     struct packet_type *ptype, *pt_prev;

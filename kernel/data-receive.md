@@ -402,7 +402,68 @@ static void net_rx_action(struct softirq_action *h)
     net_rps_action_and_irq_enable(sd);
 }
 
+static int napi_poll(struct napi_struct *n, struct list_head *repoll)
+{
+    void *have;
+    int work, weight;
+
+    list_del_init(&n->poll_list);
+
+    have = netpoll_poll_lock(n);
+
+    weight = n->weight;
+
+    /* This NAPI_STATE_SCHED test is for avoiding a race
+     * with netpoll's poll_napi().  Only the entity which
+     * obtains the lock and sees NAPI_STATE_SCHED set will
+     * actually make the ->poll() call.  Therefore we avoid
+     * accidentally calling ->poll() when NAPI is not scheduled.
+     */
+    work = 0; 
+    if (test_bit(NAPI_STATE_SCHED, &n->state)) {
+        work = n->poll(n, weight);
+        trace_napi_poll(n);
+    }    
+    WARN_ON_ONCE(work > weight);
+
+    if (likely(work < weight))
+        goto out_unlock;
+
+    /* Drivers must not modify the NAPI state if they
+     * consume the entire weight.  In such cases this code
+     * still "owns" the NAPI instance and therefore can
+     * move the instance around on the list at-will.
+     */
+    if (unlikely(napi_disable_pending(n))) {
+        napi_complete(n);
+        goto out_unlock;
+    }    
+
+    if (n->gro_list) {
+        /* flush too old packets
+         * If HZ < 1000, flush all packets.
+         */
+        napi_gro_flush(n, HZ >= 1000);
+    }    
+
+    /* Some drivers may have called napi_schedule
+     * prior to exhausting their budget.
+     */
+    if (unlikely(!list_empty(&n->poll_list))) {
+        pr_warn_once("%s: Budget exhausted after napi rescheduled\n",
+                 n->dev ? n->dev->name : "backlog");
+        goto out_unlock;
+    }
+
+    list_add_tail(&n->poll_list, repoll);
+
+out_unlock:
+    netpoll_poll_unlock(have);
+
+    return work;
+}
 ```
+
 <a id="napi-dev"/>
 ### 使用NAPI的设备
 
@@ -497,11 +558,257 @@ static irqreturn_t e100_intr(int irq, void *dev_id)
 <a id="e100-poll"/>
 #### e100的轮询
 
+调用`napi.poll`函数时指定预算buget（在`net_rx_action/napi_poll`阶段指widget），认为完成后函数返实际完成量。如果**没有**完成了所有指定的工作量，意味着NIC私有队列（FIFO）中已经没有数据了。此时就会调用`napi_complete`把自己的napi结构从`sd.poll_list`退出；同时打开NIC的中断，等有新数据后通知Kernel（之前已经提到，关闭中断并不会阻止NIC接收数据到私有的FIFO。
+
+```c
+static int e100_poll(struct napi_struct *napi, int budget)
+{
+    struct nic *nic = container_of(napi, struct nic, napi);
+    unsigned int work_done = 0; 
+
+    e100_rx_clean(nic, &work_done, budget);
+    e100_tx_clean(nic);
+
+    /* If budget not fully consumed, exit the polling mode */
+    if (work_done < budget) {
+        napi_complete(napi);
+        e100_enable_irq(nic);
+    }    
+
+    return work_done;
+}
+```
+
 <a id="non-napi-dev"/>
 ### 使用netif_rx的设备（Non-NAPI）
 
+3Com公司的3c59x网卡使用旧式的接口，即`netif_rx`。代码在driver/net/ethernet/3com/3c59x.c。中断处理函数vortex_interrupt()调用vortex_rx，后者会
+
+1. 分配skb,
+2. 使用DMA或者读寄存器（内部FIFO）的方式调用把数据复制到skb, 
+3. 调用netif_rx()。
+
+netif_rx()之前已经详细了解过了，它把共享的sd.backlog放入sd.poll_list，然后调度软中断。SoftIRQ处理函数net_rx_action调用的sd.poll是sd.backlog.poll即process_backlog。我们来看看process_backlog的实现。
+
+它总把`sd->input_skb_queue`的数据整体挪到`sd->process_queue`然后再处理。每次调用先处理`process_queue`的数据，并计算quota，如果达到了配额就不再进行处理。如果处理完了还没完成配额，就把`input_pkt_queue`的数据挪到`process_queue`尾部。然后继续处理`process_queue`。
+
+> 用两个queue的原因是和锁有关么？
+
+```c
+static int process_backlog(struct napi_struct *napi, int quota)
+{
+    int work = 0;
+    struct softnet_data *sd = container_of(napi, struct softnet_data, backlog);
+    
+    /* Check if we have pending ipi, its better to send them now,
+     * not waiting net_rx_action() end.
+     */ 
+    if (sd_has_rps_ipi_waiting(sd)) {
+        local_irq_disable();
+        net_rps_action_and_irq_enable(sd);
+    }   
+
+    napi->weight = weight_p;
+    local_irq_disable();
+    while (1) {
+        struct sk_buff *skb;
+    
+        while ((skb = __skb_dequeue(&sd->process_queue))) {
+            rcu_read_lock();
+            local_irq_enable();
+            __netif_receive_skb(skb);
+            rcu_read_unlock();
+            local_irq_disable();
+            input_queue_head_incr(sd);
+            if (++work >= quota) {
+                local_irq_enable();
+                return work;
+            }
+        }
+    
+        rps_lock(sd);
+        if (skb_queue_empty(&sd->input_pkt_queue)) {
+            /*
+             * Inline a custom version of __napi_complete().
+             * only current cpu owns and manipulates this napi,
+             * and NAPI_STATE_SCHED is the only possible flag set
+             * on backlog.
+             * We can use a plain write instead of clear_bit(),
+             * and we dont need an smp_mb() memory barrier.
+             */
+            napi->state = 0;
+            rps_unlock(sd);
+
+            break;
+        }
+
+        skb_queue_splice_tail_init(&sd->input_pkt_queue,
+                       &sd->process_queue);
+        rps_unlock(sd);
+    }
+    local_irq_enable();
+
+    return work;
+}
+```
 
 <a id="netif_receive_skb/>
 ### Ingress帧的处理：netif_receive_skb
+
+不论是NAPI的poll函数（例如e100_poll/e100_rx_indicate）还是non-napi使用的process_backlog()，最终，都会调用netif_receive_skb完成接收过程最后的处理。netif_receive_skb只是__netif_receive_skb的包裹函数，后者又是__netif_receive_skb_core的包裹函数。
+
+```c
+static int __netif_receive_skb_core(struct sk_buff *skb, bool pfmemalloc)
+{
+    struct packet_type *ptype, *pt_prev;
+    rx_handler_func_t *rx_handler;
+    struct net_device *orig_dev;
+    bool deliver_exact = false;
+    int ret = NET_RX_DROP;
+    __be16 type;
+        
+    net_timestamp_check(!netdev_tstamp_prequeue, skb);
+    
+    trace_netif_receive_skb(skb);
+
+    orig_dev = skb->dev;
+        
+    skb_reset_network_header(skb);
+    if (!skb_transport_header_was_set(skb))
+        skb_reset_transport_header(skb);
+    skb_reset_mac_len(skb);
+            
+    pt_prev = NULL;
+
+another_round:
+    skb->skb_iif = skb->dev->ifindex;
+    
+    __this_cpu_inc(softnet_data.processed);
+
+    if (skb->protocol == cpu_to_be16(ETH_P_8021Q) ||
+        skb->protocol == cpu_to_be16(ETH_P_8021AD)) {
+        skb = skb_vlan_untag(skb);
+        if (unlikely(!skb))
+            goto out;
+    }
+
+#ifdef CONFIG_NET_CLS_ACT
+    if (skb->tc_verd & TC_NCLS) {
+        skb->tc_verd = CLR_TC_NCLS(skb->tc_verd);
+        goto ncls;
+    }
+#endif
+
+    if (pfmemalloc)
+        goto skip_taps;
+
+    list_for_each_entry_rcu(ptype, &ptype_all, list) {
+        if (pt_prev)
+            ret = deliver_skb(skb, pt_prev, orig_dev);
+        pt_prev = ptype;
+    }
+
+    list_for_each_entry_rcu(ptype, &skb->dev->ptype_all, list) {
+        if (pt_prev)
+            ret = deliver_skb(skb, pt_prev, orig_dev);
+        pt_prev = ptype;
+    }
+
+skip_taps:
+#ifdef CONFIG_NET_INGRESS
+    if (static_key_false(&ingress_needed)) {
+        skb = handle_ing(skb, &pt_prev, &ret, orig_dev);
+        if (!skb)
+            goto out;
+
+        if (nf_ingress(skb, &pt_prev, &ret, orig_dev) < 0)
+            goto out;
+    }
+#endif
+#ifdef CONFIG_NET_CLS_ACT
+    skb->tc_verd = 0;
+ncls:
+#endif
+    if (pfmemalloc && !skb_pfmemalloc_protocol(skb))
+        goto drop;
+
+    if (skb_vlan_tag_present(skb)) {
+        if (pt_prev) {
+            ret = deliver_skb(skb, pt_prev, orig_dev);
+            pt_prev = NULL;
+        }
+        if (vlan_do_receive(&skb))
+            goto another_round;
+        else if (unlikely(!skb))
+            goto out;
+    }
+
+    rx_handler = rcu_dereference(skb->dev->rx_handler);
+    if (rx_handler) {
+        if (pt_prev) {
+            ret = deliver_skb(skb, pt_prev, orig_dev);
+            pt_prev = NULL;
+        }
+        switch (rx_handler(&skb)) {
+        case RX_HANDLER_CONSUMED:
+            ret = NET_RX_SUCCESS;
+            goto out;
+        case RX_HANDLER_ANOTHER:
+            goto another_round;
+        case RX_HANDLER_EXACT:
+            deliver_exact = true;
+        case RX_HANDLER_PASS:
+            break;
+        default:
+            BUG();
+        }
+    }
+
+    if (unlikely(skb_vlan_tag_present(skb))) {
+        if (skb_vlan_tag_get_id(skb))
+            skb->pkt_type = PACKET_OTHERHOST;
+        /* Note: we might in the future use prio bits
+         * and set skb->priority like in vlan_do_receive()
+         * For the time being, just ignore Priority Code Point
+         */
+        skb->vlan_tci = 0;
+    }
+
+    type = skb->protocol;
+
+    /* deliver only exact match when indicated */
+    if (likely(!deliver_exact)) {
+        deliver_ptype_list_skb(skb, &pt_prev, orig_dev, type,
+                       &ptype_base[ntohs(type) &
+                           PTYPE_HASH_MASK]);
+    }
+
+    deliver_ptype_list_skb(skb, &pt_prev, orig_dev, type,
+                   &orig_dev->ptype_specific);
+
+    if (unlikely(skb->dev != orig_dev)) {
+        deliver_ptype_list_skb(skb, &pt_prev, orig_dev, type,
+                       &skb->dev->ptype_specific);
+    }
+
+    if (pt_prev) {
+        if (unlikely(skb_orphan_frags(skb, GFP_ATOMIC)))
+            goto drop;
+        else
+            ret = pt_prev->func(skb, skb->dev, pt_prev, orig_dev);
+    } else {
+drop:
+        atomic_long_inc(&skb->dev->rx_dropped);
+        kfree_skb(skb);
+        /* Jamal, now you will not able to escape explaining
+         * me how you were going to use this. :-)
+         */
+        ret = NET_RX_DROP;
+    }
+
+out:
+    return ret;
+}
+```
 
 

@@ -1,8 +1,6 @@
 Linux Kernel之*帧的接收*
 =======================
 
-> 本文的目的是通过重读《ULNI》和目前的Kernel实现（4.x）重温网络部分帧的接收流程。虽然大部分内容都在《ULNI》中都有，毕竟2.6.12版本的Kernel已经有些年头了，书中有些地方和现在的实现会有些出入（例如`napi_struct{}`的引入，`softnet_data{}`的改变等）。借次机会再次复习复习总不会错 :-)
-
 * [Kernel和NIC的交互](#irq-poll)
 * [中断、下半部和软中断](#IRQ-BH)
   - [硬件中断](#hardware-IRQ)
@@ -22,6 +20,8 @@ Linux Kernel之*帧的接收*
   - [e100的轮询](#e100-poll)
 * [使用netif_rx的设备（Non-NAPI）](#non-napi-dev)
 * [入口帧的处理：netif_receive_skb](#netif_receive_skb)
+
+> 通过重读《ULNI》和Kernel实现（目前的版本是4.x）重温网络部分数据帧的接收流程。虽然大部分内容都在《ULNI》中都有，不过2.6.12版本的Kernel已经有些年头了，书中有些描述和现在的实现会有出入（例如`napi_struct{}`的引入，`softnet_data{}`内容的改变等）。借次机会再次复习一下已经遗忘的东西 :-)
 
 <a id="irq-poll"/>
 ### Kernel和NIC的交互
@@ -119,19 +119,8 @@ struct softnet_data {
     struct sk_buff_head process_queue; // 用于Non-NAPI设备，旧式积压队列，函数process_backlog()把
                                        // skb从sd->input_pkt_queue装异到此处，再进行收取
 
-    /* stats */
-    unsigned int        processed;
-    unsigned int        time_squeeze;
-    unsigned int        cpu_collision;
-    unsigned int        received_rps;
-    // ... RPS 和 Net FLOW ...
-    struct Qdisc        *output_queue;     // TX队列规则
-    struct Qdisc        **output_queue_tailp;
-    struct sk_buff      *completion_queue; // 完成TX可以释放的skb
-    
-#ifdef CONFIG_RPS
-    // ... ...
-#endif
+    ... Stats, RPS, Net FLOW, TX Qdisc ...
+
     unsigned int        dropped;         // 丢包统计，例如队列已满
     struct sk_buff_head input_pkt_queue; // 用于Non-NAPI设备，驱动分配skb，读取数据，把skb放入该队列
     struct napi_struct  backlog;         // 用于Non-NAPI设备，2.6.12时是 struct net_device backlog_dev;
@@ -180,9 +169,7 @@ static int __init net_dev_init(void)
         skb_queue_head_init(&sd->input_pkt_queue);
         skb_queue_head_init(&sd->process_queue);
         INIT_LIST_HEAD(&sd->poll_list);
-        sd->output_queue_tailp = &sd->output_queue;
-        ... RPS ...
-
+        ... RPS, TX queue ...
         sd->backlog.poll = process_backlog;
         sd->backlog.weight = weight_p;
     } 
@@ -201,35 +188,18 @@ static int __init net_dev_init(void)
  * Structure for NAPI scheduling similar to tasklet but with weighting
  */    
 struct napi_struct {
-    /* The poll_list must only be managed by the entity which
-     * changes the state of the NAPI_STATE_SCHED bit.  This means
-     * whoever atomically sets that bit can add this napi_struct
-     * to the per-cpu poll_list, and whoever clears that bit
-     * can remove from the list right before clearing the bit.
-     */
     struct list_head    poll_list;     // sd->poll_list元素
 
     unsigned long       state;         // NAPI_STATE_XXX
     int         weight;                // 每个NAPI实体试用的配额
-    unsigned int        gro_count; 
     int         (*poll)(struct napi_struct *, int);
-    ... netpoll ...
+    ... GRO, netpoll，timer ...
     struct net_device   *dev; 
-    struct sk_buff      *gro_list; 
     struct sk_buff      *skb; 
-    struct hrtimer      timer;
     struct list_head    dev_list;  
     struct hlist_node   napi_hash_node;
     unsigned int        napi_id;   
 };
-
-enum { 
-    NAPI_STATE_SCHED,   /* Poll is scheduled */
-    NAPI_STATE_DISABLE, /* Disable pending */
-    NAPI_STATE_NPSVC,   /* Netpoll - don't dequeue from poll_list */
-    NAPI_STATE_HASHED,  /* In NAPI hash */
-};
-
 ```
 
 > NETPOLL则提供了紧急情况下使用通过硬件polling的方式使用网络设备，可以使用它实现netconsole, kgdb-over-ethernet等。
@@ -335,7 +305,6 @@ enqueue:
 
 drop:
     ... ...
-    return NET_RX_DROP;
 }
 
 ```
@@ -404,13 +373,9 @@ static void net_rx_action(struct softirq_action *h)
 
 static int napi_poll(struct napi_struct *n, struct list_head *repoll)
 {
-    void *have;
-    int work, weight;
-
+    ... ...
     list_del_init(&n->poll_list);
-
-    have = netpoll_poll_lock(n);
-
+    ... ...
     weight = n->weight;
 
     /* This NAPI_STATE_SCHED test is for avoiding a race
@@ -439,12 +404,7 @@ static int napi_poll(struct napi_struct *n, struct list_head *repoll)
         goto out_unlock;
     }    
 
-    if (n->gro_list) {
-        /* flush too old packets
-         * If HZ < 1000, flush all packets.
-         */
-        napi_gro_flush(n, HZ >= 1000);
-    }    
+    ... GRO ...
 
     /* Some drivers may have called napi_schedule
      * prior to exhausting their budget.
@@ -527,13 +487,9 @@ NIC中断的关闭不会导致数据丢失，因为数据会被保存到NIC的�
 ```C++
 static irqreturn_t e100_intr(int irq, void *dev_id)
 {
-    struct net_device *netdev = dev_id;
-    struct nic *nic = netdev_priv(netdev);
+    ... ...
     u8 stat_ack = ioread8(&nic->csr->scb.stat_ack);
-
-    netif_printk(nic, intr, KERN_DEBUG, nic->netdev,
-             "stat_ack = 0x%02X\n", stat_ack);
-
+    ... ...
     if (stat_ack == stat_ack_not_ours ||    /* Not our interrupt */
        stat_ack == stat_ack_not_present)    /* Hardware is ejected */
         return IRQ_NONE;
@@ -597,17 +553,7 @@ netif_rx()之前已经详细了解过了，它把共享的sd.backlog放入sd.pol
 ```c++
 static int process_backlog(struct napi_struct *napi, int quota)
 {
-    int work = 0;
-    struct softnet_data *sd = container_of(napi, struct softnet_data, backlog);
-    
-    /* Check if we have pending ipi, its better to send them now,
-     * not waiting net_rx_action() end.
-     */ 
-    if (sd_has_rps_ipi_waiting(sd)) {
-        local_irq_disable();
-        net_rps_action_and_irq_enable(sd);
-    }   
-
+    ... ...
     napi->weight = weight_p;
     local_irq_disable();
     while (1) {
@@ -670,11 +616,13 @@ static int process_backlog(struct napi_struct *napi, int quota)
 
 `eth_type_trans`会,
 
-ethernet帧早于IEEE802.3的标准，而IEEE802.3向后兼容（包含了ethernet帧的定义）。方便描述，我们把802.3之前的Ethernet称为ethernet-II类型帧。ethernet-II和802.3的LLC区别可以通过检查帧的type/length字段，如果字段>1536（0x0600），就是传统ethernet-II帧（虽然802.3也包括它）；如果字段<1500，就是802.3新定义的帧；中间值为非法。对应IEEE定义的的802.3帧（>1500部分），又分为无协议类型的RAW 802.3和带逻辑链路控制（802.2 LLC）的802.3，例如STP就使用802.3 with 802.2。带LLC的情况下还能带有802.2 SNAP。RAW 802.3只有IPX使用。
-
-<div align=center><img src="images/ethernet-802.3.png" width="" height="" alt="bridge device"/></div>
+Ethernet的出现早于IEEE 802.3的标准，并且IEEE 802.3向后兼容。方便描述，我们把802.3之前的Ethernet称为ethernet-II类型帧。Ethernet-II和802.3新定义帧的区别可以通过检查帧的type/length字段，如果字段>1536（0x0600），就是传统ethernet-II帧（虽然802.3也包括它）；如果字段<1500，就是802.3新定义的帧；中间值为非法。对应IEEE定义的的802.3帧（>1500部分），又分为无协议类型的RAW 802.3和带逻辑链路控制（802.2 LLC）的802.3，例如STP就使用802.3 with 802.2。带LLC的情况下还能带有802.2 SNAP。RAW 802.3只有IPX使用。
 
 > Ethernet-II是DIX2.0 （DEC/Intel/Xerox）的说法，Cisco的相应的说法为ARPA。
+
+下图总结了上面所说的各个类型的帧。
+
+<div align=center><img src="images/ethernet-802.3.png" width="" height="" alt="bridge device"/></div>
 
 传统Ethernet-II的常见类型有：
 
@@ -709,13 +657,13 @@ eth_type_trans函数完成的工作是，
 
 ```C++
 static int __netif_receive_skb_core(struct sk_buff *skb, bool pfmemalloc)
-{   
-    ... ..
-    // 记录下本次调用时，skb所在的dev，如果只是简单的从物理网卡接收，稍后递交到L3的情况比较简单
-    // 但如果要经过虚拟设备，例如VLAN和Bridge，skb->dev会在虚拟设备的驱动中改为虚拟设备的dev。
+```
+
+函数非常长，因此分段描述，
+
+```C++
     orig_dev = skb->dev;
     
-    // 设置L2,L3 header的位置（偏移）和MAC地址长度以备用
     skb_reset_network_header(skb);
     if (!skb_transport_header_was_set(skb))
         skb_reset_transport_header(skb);
@@ -724,19 +672,109 @@ static int __netif_receive_skb_core(struct sk_buff *skb, bool pfmemalloc)
     pt_prev = NULL;
 
 another_round:
-    skb->skb_iif = skb->dev->ifindex;  // 记录设备ifindex
+    skb->skb_iif = skb->dev->ifindex;
     ... ...
+```
 
-    // 之前eth_type_trans()设置skb->protocol指出ethernet帧数802.3还是802.2 LLC
+首先记录下本次调用时skb所在的dev，如果只是从物理网卡接收，稍后递交到L3的，那情况情况比较简单就是NIC的net_dev。但如果skb要经过虚拟设备，例如VLAN和Bridge，skb->dev会在虚拟设备的驱动中改为虚拟设备的dev。
+
+设置L2,L3 header的位置（偏移）和MAC地址长度以备用，同时记录当前设备的ifindex。
+
+```C++
     if (skb->protocol == cpu_to_be16(ETH_P_8021Q) ||
         skb->protocol == cpu_to_be16(ETH_P_8021AD)) {
         skb = skb_vlan_untag(skb);
-        if (unlikely(!skb))
-            goto out;
+        ... ...
+    }
+```
+
+这里保存并剥去一个VLAN tag。也就是帧类型为802.1q VLAN (0x8100)或者802.1ad QinQ (0x88A8)的情况，如果是QinQ只处理前一个VLAN tag。802.1q VLAN有4个Bype，前2 Byte称为Tag Protocol Identifier（TPI）它和Ethernet-II的type字段复用；且已经保存到了skb->protocol。后2 Byte为Tag Control Info（TCI），包含了Priority和VID。`skb_vlan_untag`把VLAN首部的TCI的2B保存到skb->vlan_tci（TPI已经在skb->protocol）。然后就能安全的执行untag操作，剥去（跳过）skb的VLAN tag，重新设置各层Header的偏移。
+
+```C++
+    list_for_each_entry_rcu(ptype, &ptype_all, list) {
+        if (pt_prev)
+            ret = deliver_skb(skb, pt_prev, orig_dev);
+        pt_prev = ptype;
     }
 
+    list_for_each_entry_rcu(ptype, &skb->dev->ptype_all, list) {
+        if (pt_prev)
+            ret = deliver_skb(skb, pt_prev, orig_dev);
+        pt_prev = ptype;
+    }
+```
 
+这部分是嗅探器（sniffer）的处理，将sbk递叫给所有嗅探器。`ptype_all`用来保存那些对“所有类型帧”感兴趣的Sniffer所注册的递交函数。在应用层可以通过`socket(AF_PACKET, SOCK_XXX, ETH_P_ALL)`接收所有类型的Ethernet数据。除了全局的`ptype_all`列表，每个设备也有一个列表，用来接收本设备所有类型的帧。`deliver_skb`会调用注册`packet_type`时所指定的回调函数。注意的是ptype的处理，是“向后延缓一次”的。即遍历ptype_all的时候先之前一个ptype，然后记录下本次ptype待下次处理。
+
+> Kernel中的taps只“分接器”，而Sniffer就是一种tap。
+
+```c++
+    if (skb_vlan_tag_present(skb)) {
+        if (pt_prev) {
+            ret = deliver_skb(skb, pt_prev, orig_dev);
+            pt_prev = NULL;
+        }
+        if (vlan_do_receive(&skb))     
+            goto another_round;            
+        else if (unlikely(!skb))       
+            goto out;
+    }  
+```
+
+之前的`skb_vlan_untag`部分VLAN untag处理只是把信息保存到了skb->vlan_tci并移动skb的指针剥去了一个VLAN tag，但那个tag并没有被真正的处理。因为延缓一次ptype_all处理的关系，如果必要进行那次deliver。
+
+`vlan_do_receive`真正进行VLAN tag的处理（net/8021q/vlan_core.c）。它根据VLAN 协议 VLAN ID等信息在LowerLayer（当前）设备（LowerLayer设备通常是真实设备，但VLAN设备也可以在其他虚拟设备上建立，此时就是指那个虚拟设备）上所添加的VLAN设备。修改skb->dev为VLAN设备，检查MAC目的地址是否是自己的，如果是就修订skb->pkt_type为PACKET_HOST（LowerLayer设备可能认为目的不是自己，因为MAC地址不同）。设置skb->vlan_tci为0。
+
+我们看到skb通过VLAN设备的时候，除了判断MAC是否是自己的，没有其他措施，因为VLAN tag之前已经剥离了，只需要将vlan_tci设置为0表示VLAN这层处理过了。
+
+```C++
+    rx_handler = rcu_dereference(skb->dev->rx_handler);
+    if (rx_handler) {
+        if (pt_prev) {
+            ret = deliver_skb(skb, pt_prev, orig_dev);
+            pt_prev = NULL;
+        }
+        switch (rx_handler(&skb)) {
+        case RX_HANDLER_CONSUMED:
+            ret = NET_RX_SUCCESS;
+            goto out;
+        case RX_HANDLER_ANOTHER:
+            goto another_round;
+        case RX_HANDLER_EXACT:
+            deliver_exact = true;
+        case RX_HANDLER_PASS:
+            break;
+        default:
+            BUG();
+        }
+    }
+```
+
+Kernel给`net_device`留了个RX Hook，即dev->rx_handler。用来处理设备特殊的逻辑，例如Bridging设备就使用了该钩子。Bridging具体的用法在这就不描述了。
+
+```c++
+    if (unlikely(skb_vlan_tag_present(skb))) {
+        if (skb_vlan_tag_get_id(skb))
+            skb->pkt_type = PACKET_OTHERHOST;
+        /* Note: we might in the future use prio bits
+         * and set skb->priority like in vlan_do_receive()
+         * For the time being, just ignore Priority Code Point
+         */
+        skb->vlan_tci = 0;
+    }
+```
+
+走到这，如果有vlan tag的话应该已经被处理了，也就是vlan_tci应该被设置为0了，如果不为0，说明那个VLAN tag不是自己应该处理的。也就是没有VID对应的VLAN设备的情况下收到了这个VLAN的包，那么就认为不是自己应该接收的。
+
+```C++
+    type = skb->protocol;
+    ... ...
+    deliver_ptype_list_skb(skb, &pt_prev, orig_dev, type,
+                   &orig_dev->ptype_specific);
+    ... ...
 
 ```
+
+遍历ptype_base进行L2/L3分用递交。每个L3都会注册自己的ptype_packet到ptype_base。
 
 END

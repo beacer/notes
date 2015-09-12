@@ -655,9 +655,88 @@ static int process_backlog(struct napi_struct *napi, int quota)
 <a id="netif_receive_skb"/>
 ### Ingress帧的处理：netif_receive_skb
 
-不论是NAPI NIC自己实现的poll函数（例如e100_poll/e100_rx_indicate）还是non-napi统一使用的process_backlog()，最终，它们都会调用netif_receive_skb完成接收过程最后的处理。netif_receive_skb只是__netif_receive_skb的包裹函数，后者又是__netif_receive_skb_core的包裹函数。它是一个很长的函数，也是Ingress处理最后的阶段，弄清了它能帮助我们了解，
+不论是NAPI NIC自己实现的poll函数（例如`e100_poll/e100_rx_indicate`）还是non-napi统一使用的`process_backlog`，最终它们都会调用`netif_receive_skb`完成接收过程最后的处理。`netif_receive_skb`只是`__netif_receive_skb`的包裹函数，后者又是`__netif_receive_skb_core`的包裹函数。作为Ingress处理最后的阶段，它实现了，
 
-1. 如何将skb从L2向L3递交；
-2. 虚拟设备，如VLAN、Bridge设备实现。
+1. 将skb从L2向L3递交；或者，
+2. 将skb虚拟设备递交，如VLAN、Bridge设备。
+
+#### Ethernet帧类型和eth_type_trans函数
+
+有一点要说明，设备驱动分配完skb后都会使用eth_type_trans()设置skb->protocol。例如旧驱动3c59x在调用netif_rx前，或者NAPI设备e100在其poll函数实现的时候。且这一步总是在`netif_receive_skb`前完成。
+
+```C++
+    skb->protocol = eth_type_trans(skb, dev)
+```
+
+`eth_type_trans`会,
+
+ethernet帧早于IEEE802.3的标准，而IEEE802.3向后兼容（包含了ethernet帧的定义）。方便描述，我们把802.3之前的Ethernet称为ethernet-II类型帧。ethernet-II和802.3的LLC区别可以通过检查帧的type/length字段，如果字段>1536（0x0600），就是传统ethernet-II帧（虽然802.3也包括它）；如果字段<1500，就是802.3新定义的帧；中间值为非法。对应IEEE定义的的802.3帧（>1500部分），又分为无协议类型的RAW 802.3和带逻辑链路控制（802.2 LLC）的802.3，例如STP就使用802.3 with 802.2。带LLC的情况下还能带有802.2 SNAP。RAW 802.3只有IPX使用。
+
+<div align=center><img src="images/ethernet-802.3.png" width="" height="" alt="bridge device"/></div>
+
+> Ethernet-II是DIX2.0 （DEC/Intel/Xerox）的说法，Cisco的相应的说法为ARPA。
+
+传统Ethernet-II的常见类型有：
+
+|type|protocol|
+|-------|:--------|
+|0x0800 | IPv4   |
+|0x0806 | ARP    |
+|0x86DD | IPv6   |
+|0x8100 | 802.1q VLAN |
+
+因为现实中只有IPX使用RAW的802.3（不带802.2 LLC），因此Kernel使用ETH_P_802_3表示这种IPX使用的RAW 802.3，而ETH_P_802_2表示带有LLC的802.3。
+
+eth_type_trans函数完成的工作是，
+
+1. 设置skb->dev
+2. 设置skb->pkt_type，PACKET_HOST/OTHERHOST/MULTICAST/BROADCAST等
+3. 根据Ethernet的type/length字段（与1536, 0x0600比较）判断它是
+
+于是这个函数的返回值是：
+* eth->h_proto: 总是大于1536，如0x0800, 0x8100 （VLAN）
+* ETH_P_802_3: RAW 802.3 for IPX only
+* ETH_P_802_2: 802.3 with 802.2 (LLC)
+   这个值作为返回值ETH_P_802_3或ETH_P_802_2，设置到skb->protocol。
+
+> Kernel中的eth_proto_is_802_3函数其实是指，type/length作为type使用，也就是说帧是ethernet-II类型。
+
+#### 实际设备和虚拟设备
+
+实际设备和虚拟设备，或者虚拟设备和虚拟设备之间总是有上下的串联关系。意味着从RX的角度，skb会先后通过不同设备，每次通过的时候`skb->dev`会设置为当前设备的`net_device`结构。
+
+#### __netif_receive_skb_core函数
+
+```C++
+static int __netif_receive_skb_core(struct sk_buff *skb, bool pfmemalloc)
+{   
+    ... ..
+    // 记录下本次调用时，skb所在的dev，如果只是简单的从物理网卡接收，稍后递交到L3的情况比较简单
+    // 但如果要经过虚拟设备，例如VLAN和Bridge，skb->dev会在虚拟设备的驱动中改为虚拟设备的dev。
+    orig_dev = skb->dev;
+    
+    // 设置L2,L3 header的位置（偏移）和MAC地址长度以备用
+    skb_reset_network_header(skb);
+    if (!skb_transport_header_was_set(skb))
+        skb_reset_transport_header(skb);
+    skb_reset_mac_len(skb);
+
+    pt_prev = NULL;
+
+another_round:
+    skb->skb_iif = skb->dev->ifindex;  // 记录设备ifindex
+    ... ...
+
+    // 之前eth_type_trans()设置skb->protocol指出ethernet帧数802.3还是802.2 LLC
+    if (skb->protocol == cpu_to_be16(ETH_P_8021Q) ||
+        skb->protocol == cpu_to_be16(ETH_P_8021AD)) {
+        skb = skb_vlan_untag(skb);
+        if (unlikely(!skb))
+            goto out;
+    }
+
+
+
+```
 
 END

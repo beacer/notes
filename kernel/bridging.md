@@ -419,11 +419,9 @@ git://git.kernel.org/pub/scm/linux/kernel/git/shemminger/iproute2.git
 
 ###### 使用netlink创建网桥设备
 
-初始化网桥模块的时候，注册了br_link_ops。
+初始化网桥模块的时候（`br_init`），调用`br_netlink_init()`向rtnl注册了`br_link_ops`用于后续的netlink操作。
 
 <div align=center><img src="images/br-netlink.png" width="" height="" alt="bridge device"/></div>
-
-
 
 当用户使用NETLINK（例如ip命令）创建一个新网桥设备的时候，网桥设备创建过程如下图所示，
 
@@ -432,14 +430,14 @@ git://git.kernel.org/pub/scm/linux/kernel/git/shemminger/iproute2.git
 
 ###### 使用ioctl创建网桥设备
 
-当使用传统的ioctl创建网桥设备，例如brctl命令的时候，则从br_add_bridge()函数开始。可以看到只是call flow略有不同。实际上的工作是类似的，区别只是利用netlink框架与否而言。
+当使用传统的ioctl创建网桥设备，例如brctl命令的时候，则从br_add_bridge()函数开始。可以看到，ioctl和netlink只是call flow略有不同。底层实际上的工作是类似的，区别在于是否利用netlink框架。
 
 <div align=center><img src="images/br-ioctl-create.png" width="" height="" alt="bridge device"/></div>
 
 
 ###### br_dev_setup()函数
 
-我们有必要看看br_dev_setup()，它的实现在net/bridge/br_device.c中。
+不论使用netlink还是传统的ioctl都会调用`alloc_netdev_mqs`，后者会调用setup函数`br_dev_setup`。它的实现在`net/bridge/br_device.c`中。
 
 ```c++
 void br_dev_setup(struct net_device *dev)
@@ -489,29 +487,33 @@ void br_dev_setup(struct net_device *dev)
 }
 ```
 
+先为网桥设备生成一个随机的MAC地址，当bridge的第一个接口被binding的时候，bridge的MAC字段自动转为第一个接口的地址。虚拟网桥设备上ethernet类型，因此会调用`ether_setup()`。
+
 每个net_device有一组netdev_ops用来处理设备打开、关闭，传输等，Bridge的net_device_ops内容则更丰富一些，需要ndo_add_save, ndo_fdb_add稍后详细介绍。ethtool可用来查看链接是否UP，以及设备的信息（驱动类型，版本，固件版本，总线等）。
 
 开始的时候网桥总是认为自己是根网桥，所有designeated_root设置成自己网桥ID。而一些STP的定时器也需要设置成默认值。有些定时器是双份的，原因是STP的Timer是由Root Bridge通告，而不是使用自己的值。但是自己也可能会成为Root，所以要维护一份自己的定时器值。
 
 <a id="br-port-add">
-#### 添加、删除网桥端口
+##### 添加、删除网桥端口
 
-和创建网桥设备一样，为网桥设备添加端口设备，也可以使用两种方式ioctl和netlink。
+和创建网桥设备一样，为网桥设备添加端口设备，也可以使用ioctl和netlink两种方式。两种方式最终会调用`br_add_if()`。
 
 <div align=center><img src="images/brif-add-del.png" width="" height="" alt="bridge device"/></div>
 
 ###### br_add_if()函数
 
+```C++
 int br_add_if(struct net_bridge *br, struct net_device *dev)
+```
 
-端口资格检查
+端口资格检查，有几类设备不能作为网桥端口：
+* loopback设备
+* 非Ethernet设备
+* 网桥设备，即不支持“网桥的网桥”
+* 本身是另一个网桥设备端口。每个设备只能有一个Master，否则数据去哪里呢
+* 配置为IFF_DONT_BRIDGE的设备
 
-有几类设备不能作为网桥端口：
-loopback设备
-非Ethernet设备
-网桥设备，即不支持“网桥的网桥”
-已经作为另一个网桥设备端口的设备。每个设备只能有一个Master，否则数据去哪里呢
-配置为IFF_DONT_BRIDGE的设备
+```C++
    /* Don't allow bridging non-ethernet like devices */
     if ((dev->flags & IFF_LOOPBACK) ||
         dev->type != ARPHRD_ETHER || dev->addr_len != ETH_ALEN ||
@@ -529,32 +531,35 @@ loopback设备
     /* No bridging devices that dislike that (e.g. wireless) */
     if (dev->priv_flags & IFF_DONT_BRIDGE)
         return -EOPNOTSUPP;
+```
 
-端口结构分配和初始化
+如果新的端口设备没有问题，就可以进行分配和初始化`net_bridge_port{}`，这些工作由`new_nbp()`完成。
+* 分配一个net_bridge_port{}结构;
+* 分配端口ID。
+* 初始化端口成本（协议规定万兆、千兆，百兆和十兆的默认成本为2, 4, 19和100），
+* 设置端口默认优先级，
+* 初始化端口角色（dp）状态（blocking）。
+* 启动STP定时器等。
 
-如果新的端口设备没有问题，就可以进行分配和初始化net_bridge_port{}，这几步都是new_nbp()完成。
-分配一个net_bridge_port{}结构;
-分配端口ID，
-初始化端口成本（协议规定万兆、千兆，百兆和十兆的默认成本为2, 4, 19和100），
-设置端口默认优先级，
-初始化端口角色（dp）状态（blocking）。
-启动STP定时器等。
+网桥设备需要接收所有的组播包，原来此处调用的是 dev_set_promiscuity(dev, 1)让网桥端口（可能是实际设备）工作在混杂模式，这样才能接收目的MAC非此设备的Unicast以及（未join的）所有的Multicast。现在换成了 dev_set_allmulti()。其原因可以在commit 2796d0c648c里找到。
+
+```c++
     p = new_nbp(br, dev);  
     if (IS_ERR(p))
         return PTR_ERR(p); 
 
     call_netdevice_notifiers(NETDEV_JOIN, dev);
 
-网桥设备需要接收所有的组播包，原来此处调用的是 dev_set_promiscuity(dev, 1)让网桥端口（可能是实际设备）工作在混杂模式，这样才能接收目的MAC非此设备的Unicast以及（未join的）所有的Multicast。现在换成了 dev_set_allmulti()。其原因可以在commit 2796d0c648c里找到。
-
     err = dev_set_allmulti(dev, 1);
     if (err)      
         goto put_back;
+```
 
 sysfs和kobj
 
 Kernel为所有的网桥端口建立一个kobj，这样一来可以方便的使用sysfs_ops设置sysfs参数，以及其他对象操作（例如删除对象的时候，release_nbp被调用以删除net_bridge_port结构。通过，kobject_init_and_add/br_sysfs_addif实现p->kobj的初始化和注册等。一旦注册，就可以在/sys/class/net/<brname>/brif/<ifname>/找到它相应的目录。
 
+```c++
     err = kobject_init_and_add(&p->kobj, &brport_ktype, &(dev->dev.kobj),
                    SYSFS_BRIDGE_PORT_ATTR);
     if (err)
@@ -563,21 +568,28 @@ Kernel为所有的网桥端口建立一个kobj，这样一来可以方便的使�
     err = br_sysfs_addif(p);
     if (err)     
         goto err2;
+```
 
 设备从属关系（adjacent）
 
-略。
-
+```c++
     err = netdev_master_upper_dev_link(dev, br->dev);
     if (err)
         goto err4;
+```
+
+之前介绍各个数据结构关系的时候，提到了端口设备`net_device{}`结构和`net_bridge_port{}`如何关联。即原来通过`net_device->br_port`的联系方式在新的实现中，已经由`priv_flags`和`rx_handler_data`替代。同时也提到了，netif_receive_skb()的L2/L3分用（查询ptype_base）之前，会先调用设备本身的RX处理钩子 dev->rx_handler。
+
+* 原关系图
+
+<div align=center><img src="images/dev-and-port1.png" width="" height="" alt="bridge device"/></div>
+
+* 新关系图
+
+<div align=center><img src="images/dev-and-port2.png" width="" height="" alt="bridge device"/></div>
 
 注册rx_handler/rx_handler_data
 
-之前介绍各个数据结构关系的时候，提到了端口设备net_device{}结构和net_bridge_port{}如何关联。即原来通过net_device->br_port的联系方式在新的实现中，已经由 priv_flags和 rx_handler_data替代。同时也提到了，netif_receive_skb()的L2/L3分用（查询ptype_base）之前，会先调用设备本身的RX处理钩子 dev->rx_handler。
-
-         原关系图                      新关系图
-       
 
 注册rx_handler和rx_handler_data的过程有netdev_rx_handler_register完成。既然是网桥端口那么dev->priv_flags被设置上IFF_BRIDGE_PORT。同时网桥端口不支持LRO，原因是LRO（Large Receive Offload）适用于目的为Host的Packet，而网桥端口可能会转发数据到其他端口，自然就不能启用这个功能（启用了还会影响GSO）。
 

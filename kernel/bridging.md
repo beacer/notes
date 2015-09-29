@@ -14,6 +14,8 @@ Kernel虚拟设备 之 *网桥（Bridging）*
   - [创建网桥设备](#br-create)
   - [添加、删除网桥端口](#br-port-add)
   - [打开、关闭网桥端口](#br-open-close)
+* [入口流量:本地递交与转发](#ingress-forwarding)
+  - [rx_handler的处理](#rx_handler)
 
 <a id="br-dev" />
 #### 网桥虚拟设备
@@ -725,41 +727,47 @@ static int br_dev_open(struct net_device *dev)
 }  
 ```
 
+<a id="ingress-forwarding">
+#### 入口流量:本地递交与转发
 
+和IP协议类似，网桥的数据流有3个方向：
 
+* 从端口接收，递交到协议栈（ingress）
+* 从协议栈发送到端口（egress）
+* 端口之间的转发（forwarding）
 
+网桥运行STP/RSTP的话，那只有处于`forwarding`状态端口才能转发数据。而只要端口不是`disable`就能进行BPDU的接收、发送。我们假设端口已经进入`Forwarding`，来看看数据接收流程（ingress flow）。
 
+虚拟网桥设备的数据接收一定是从其端口设备开始的，不论端口是真是设备或者其他类型的虚拟设备，最后traffic总要到达`netif_receive_skb`。之前提到的添加网桥端口（`br_add_if()`）时会建立 端口结构`net_bridge_port`和端口相关`net_device`的关系，也意味着注册了`dev->rx_handler`（即`br_handle_frame`）和 `rx_handler_data`（即`net_bridge_port{}`）。
 
-
-5. Ingress Traffic: Local Deliver & Forwarding
-
-网桥的数据流有3个方向：
-从端口接收，递交到协议栈（ingress）
-从协议栈发送到端口（egress）
-端口之间的转发（forwarding）
-如果运行STP（RSTP）的话，不是所有端口都能转发数据，只有处于forwarding状态端口才行，但只要端口不是disable那所有的BPDU是可以接收、发送的。现在假设端口已经进入Forwarding，来看看数据接收流程（ingress flow）。
-
-虚拟网桥设备的数据接收一定是从其端口设备开始的，不论端口是真是设备或者其他类型的虚拟设备，最后traffic总要到达 netif_receive_skb。之前提到的添加网桥端口（ br_add_if()）时会建立 net_bridge_port和端口 net_device的关系，即注册了 rx_handler和 rx_handler_data（即net_bridge_port{}）。
-
-
-
+```c++
 br_add_if()
     +
-    |-netdev_rx_handler_register(dev, br_handle_frame, p);
+    \-netdev_rx_handler_register(dev, br_handle_frame, p);
+```
 
-5.1 netif_receive_skb处理rx_handler
+我们从网桥端口设备的rx_handler看起。
 
-之前还说到 netif_receive_skb将数据进行按照 ptype_base进行L2/L3递交前，会检查dev的rx_handler，如果不为空则先调用rx_handler，然后根据rx_hander的返回决定skb的去向。我们以网桥端口设备的视角看看 __netif_receive_skb_core的实现。
+<a id="rx_handler" />
+##### rx_handler的处理
 
-其中pt_prev的作用是什么呢？从ptype_base在找到匹配的Protocol后先不忙着递交，而是记录下pt_prev。等到了不得不递交的时候，即skb马上做某些处理了，再递交到上次记录下的pt_prev。那么何苦要那么费劲延迟递交呢？原因是为了减少一次kfree_skb()。http://bbs.chinaunix.net/thread-1933943-1-1.html
+之前说到`netif_receive_skb`将数据进行按照`ptype_base`进行L2/L3递交前，会检查dev的`rx_handler`，如果不为空则先调用它，然后根据其的返回决定skb的去向。我们以*网桥端口*设备的视角看看 `__netif_receive_skb_core`的实现。
 
-rx_handler的返回会决定skb的后续去向（从rx_handler_result的注释可以看到清楚的解释），
-RX_HANDLER_CONSUMED 那么skb已经被rx_handler消费，不必继续处理，可以释放了。
-RX_HANDLER_ANOTHER  需要进行另一轮（another_round的处理），暗示skb->dev被修改，传给了另一个net_device{}，再来一次。。
-RX_HANDLER_EXACT    强制进行“确定的递交”（Exactly Deliver），不能通配递交。匹配意味着skb->dev必须和ptype->dev一样。
-RX_HANDLER_PASS     就像rx_hanlder没有被调用过一样来处理skb
-经过rx_handler的处理后，会根据其返回进行后续动作：结束处理，再来一遍，继续ptype_base查询与递交等。。
+> 相关代码片段中的`pt_prev`的作用是什么呢？从`ptype_all/ptype_base`在找到匹配的ptype后（内含递交函数）后先不忙着递交，而是先记录到pt_prev，等到了不得不递交的时候，即skb马上做某些处理了，再递交到上次记录下的pt_prev。那么何苦要那么费劲延迟递交呢？原因是为了减少一次kfree_skb()。http://bbs.chinaunix.net/thread-1933943-1-1.html
 
+rx_handler的返回值会决定skb的后续去向（从rx_handler_result的注释可以看到清楚的解释），
+* RX_HANDLER_CONSUMED 
+  `skb`已经被`rx_handler`消费，不必继续处理，可以释放了。
+* RX_HANDLER_ANOTHER
+  需要进行另一轮（`another_round`的处理），暗示`skb->dev`被修改，传给了另一个`net_device{}`，（跳转到`__netif_receive_skb_core`较早的位置）再来一次相关流程。。
+* RX_HANDLER_EXACT
+  强制进行“确定的递交”（Exactly Deliver），不能通配递交。匹配意味着`skb->dev`必须和`ptype->dev`一样。
+* RX_HANDLER_PASS
+  就像rx_hanlder没有被调用过一样来处理skb。
+
+就是说经过`rx_handler`的处理后，`skb`会根据其返回进行后续动作：结束处理，再来一遍，继续ptype_base查询与递交等。。
+
+```c++
 static int __netif_receive_skb_core(struct sk_buff *skb, bool pfmemalloc)
 {
     ... ...
@@ -805,10 +813,15 @@ another_round:
 
     ... ...
 }
+```
+
+那么问题来了，**网桥端口设备**返回的到底是哪个呢？是不是把skb->dev替换成了**网桥设备**并返回了RX_HANDLER_ANOTHER的方式重走大部分netif_receive_skb呢？我们继续往下看。
+
+> 其实不是那样 :) 网桥端口返回的是CONSUMED，而网桥端口的处理过程中如果需要向上递交会再次调用netif_receive_skb，而不是返回HANDLER_ANOTHER。
 
 5.2 网桥端口设备rx_handler: br_handle_frame
 
-好，现在我们看看bridge端口的处理函数 br_handle_frame如何处理skb和指示后续操作。该函数位于br_input.c中。
+好，现在我们看看bridge**端口**的处理函数 br_handle_frame如何处理skb和指示后续操作。该函数位于br_input.c中。
 
 rx_handler_result_t br_handle_frame(struct sk_buff **pskb)
 {

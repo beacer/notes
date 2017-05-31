@@ -11,7 +11,7 @@
 VLAN作为一种虚拟设备(`vlan-device`)，需要构建在“真实(real-device)”设备之上，这里的“真实”设备即可以是物理网卡（例如,`eth0`）,
 也可以是其他虚拟设备，如`bonding`设备。同时、一个real-device，可以”挂“多个VLAN设备。 例如下图所描述的情况，
 
-[real-device](images/vlan-real-devices.png)
+![real-device](images/vlan-real-devices.png)
 
 * `eth0`是物理网卡，`eth0.100`和`eth0.200`分别模拟了两个VLAN的`access port`。
 * 带VLAN tag的数据被`eth0`接收后，如果tag是100,则交由`eth0.100`再进入协议栈。
@@ -101,7 +101,7 @@ struct vlan_group {
 
 多维Hash表结构如图所示，
 
-[vlan_devices_arrays](images/vlan_devices_array.png)
+![vlan_devices_arrays](images/vlan_devices_array.png)
 
 ###### XXX：`vlan_vid_info`
 
@@ -109,4 +109,4 @@ struct vlan_group {
 
 综上所述，一个Real设备和挂载（attach）的VLAN虚拟设备的数据结构关系如下，
 
-[real-vlan-devices](images/vlan-real-devices.png)
+![real-vlan-devices](images/vlan-real-devices.png)

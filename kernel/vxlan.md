@@ -31,18 +31,29 @@ struct vxlan_dev {
 };
 ```
 
-每个`vxlan_dev`隶属于一个*VNI*。同时，每个`vxlan_dev`都有对应的UDP socket，即`vxlan_sock`，可理解为RFC中的VTEP 。默认情况下，多个监听相同*vxlan端口*的`vxlan_dev`共享同一个`vxlan_sock`。 
+* hlist
+* vn4_sock
+* vn6_sock
 
-> 监听的vxlan端口即`vxlan_config.dst_port`字段，它表示本地监听的UDP vxlan端口，即接收的vxlan包的outer-UDP的目的port。见[vlan_config](#VXLAN配置)。
+每个`vxlan_dev`隶属于一个*VNI*。同时，每个`vxlan_dev`都有对应的UDP socket，即`vxlan_sock`，可理解为RFC中的VTEP 。默认情况下，多个监听相同*vxlan端口*的`vxlan_dev`共享同一个`vxlan_sock`（共享一个VTEP）。所以，`vxlan_sock`维护了一个`vxlan_dev`的Hash表 ，Hash Key为VNI。`vxlan_dev.hlist`即该Hash的节点。
 
-`vxlan_dev`在发Inner Unicast Ethernet包的时候，先搜索FDB。如果查找失败，测目的MAC未Unknow MAC Destination，这是需要使用默认Remote `vxlan_dev.default_dst`发送组播数据。
+> 监听的vxlan端口即`vxlan_config.dst_port`字段，它表示本地监听的UDP vxlan端口。
 
+* default_dst
+
+对于目的MAC对端VTEP未知（Unknow MAC Destination）的数据需要使用默认Remote即`vxlan_dev.default_dst`发送组播数据。此外，多播和广播也会映射到underlay的多播，它会保存在`default_dst`中。`vxlan_dev`所在的VNI保存在`default_dst.remove_vni`。
+
+* hash_lock
+* fdb_head
+* age_timer
+
+`vxlan_dev`在发Inner Ethernet包的时候，先根据目的MAC搜索FDB，FDB是一个Hash表。同时为FDB维护了一个老化定时器，定期进行垃圾收集。`hash_lock`用户保护FDB Hash。
 
 #### UDP Socket
 
-每个vxlan设备都有对应的UDP Socket有用于发送接收underlay的UDP数据报，同时多个vxlan设备（每个vxlan 设备都有自己的VNI）可能会共享`vxlan_sock`，例如所有vxlan目的端口（如4789）相同的vxlan设备，默认会共享一个`vxlan_sock`。因此`vxlan_sock`维护一个以VNI为key的哈希表，表的节点是`vxlan_dev`。
+每个vxlan设备都有对应的UDP Socket用于发送接收封装VXLAN报文的underlay UDP数据报，同时多个vxlan设备（每个vxlan 设备都有自己的VNI）可能会共享`vxlan_sock`。因此`vxlan_sock`维护一个以VNI为key的哈希表，表的节点是`vxlan_dev`。
 
-> 实际上，"no_shared"参数未打开，且元组`<net-namespace, family, vxlan-port, flags>`相同才会共享。
+> 除非打开"no_shared"参数，否则只要元组`<net-namespace, family, vxlan-port, flags>`相同就会共享。
 
 ```C
 /* per UDP socket information */
@@ -55,7 +66,7 @@ struct vxlan_sock {
 };
 ```
 
-`flags`表示不同的vxlan vtep工作模式，包括，是否打开“data plane learning", 是否进行UDP TX Checksum等。具体参考`net/vxlan.h`中`VXLAN_F_XXX`的定义。
+`flags`表示不同的vxlan vtep工作模式，包括，是否打开“data plane learning", 是否支持RSC，是否作为ARP代理实现ARP redution等。具体参考`net/vxlan.h`中`VXLAN_F_XXX`的定义。
 
 #### VXLAN配置
 
@@ -71,7 +82,7 @@ ip link add vxlan0 type vxlan id 42 group 239.1.1.1 dev eth1 dstport 4789
 ip link help vxlan
 ```
 
-具体可参考ip(8)或者[vxlan配置](https://www.kernel.org/doc/Documentation/networking/vxlan.txt)。`iproute2`工具通过netlink操作vxlan设备，相关netlink参数被转换并保存在`vxlan_config`结构中。
+可参考ip(8)或者[vxlan配置](https://www.kernel.org/doc/Documentation/networking/vxlan.txt)。`iproute2`工具通过netlink操作vxlan设备，相关netlink参数被转换并保存在`vxlan_config`结构中。
 
 ```C
 struct vxlan_config {
@@ -99,6 +110,8 @@ struct vxlan_config {
 
   当转发表(FDB)中没有目的MAC的entry时，或发送广播、多播时，Outter IP使用该多播地址发送vxlan数据。
   该字段可通过`ip`命令的*group*或*remote*参数配置。
+  
+ > 创建设备时会为remote_ip创建一个zero_mac的FDB条目，发包总是查询FDB。
 
 * `dst_port`
 
@@ -130,6 +143,62 @@ struct vxlan_net {
 * `vxlan_list`: 所在network namespace中所有的vxlan虚拟设备，即`vxlan_dev`。
 * `sock_list`: namespace中，维护所有的vxlan的UDP Sockets，即`vxlan_sock`。
 
+
+#### 转发数据库
+
+`vxlan_dev`维护了`vxlan_fdb`的Hash表，即`vxlan_dev.fdb_head`，Key是Remote MAC和VNI。`hlist`是该Hash的节点。`vxlan_fdb`为FDB表。
+
+
+```C
+/* Forwarding table entry */
+struct vxlan_fdb {
+        struct hlist_node hlist;        /* linked list of entries */ // vxlan_dev.fdb_head表节点
+        struct rcu_head   rcu;                                                                                      
+        unsigned long     updated;      /* jiffies */              // 最近修改时间                      
+        unsigned long     used;                                          // 最近使用时间                    
+        struct list_head  remotes;                                     // vxlan_rdst链表                        
+        u8                eth_addr[ETH_ALEN];                        // 源MAC
+        u16               state;        /* see ndm_state */                                                         
+        __be32            vni;                                                 // 所在VNI
+        u8                flags;        /* see ndm_flags */                                                         
+};
+```
+
+* hlist
+
+Hash表`vxlan_dev.fdb_head`节点。
+
+* updated
+* used
+   上次使用、更新的时间，used用于垃圾收集等。
+
+* eth_addr
+
+目的（目标VMMAC地址。
+
+* remotes
+   VTEP信息保存于`vxlan_rdst`。`remotes`即`vxlan_dst`链表。对于多播/all_zero MAC，一个源MAC可能有多个remote，发送数据时会向每个remote发送一个skb的拷贝。
+	1. all_zero MAC：remotes是多播（vxlan默认多播），或者多个Unicast。
+	2. Multicast MAC：有多个VTEP加入该多播组。（可用`bridge fdb add/del/append/replace`配置）
+
+* vni
+所在VNI。
+
+结构`vxlan_rdst`描述remote VTEP。包括对方的IP，UDP端口，VNI和通往对方的本地vxlan接口ifindex以及路由缓存。
+
+```C
+struct vxlan_rdst {
+        union vxlan_addr         remote_ip;
+        __be16                   remote_port;
+        __be32                   remote_vni;
+        u32                      remote_ifindex;
+        struct list_head         list;
+        struct rcu_head          rcu;
+        struct dst_cache         dst_cache;
+};
+```
+
+> fdb可以用*bridge*命令查看 `bridge fdb show dev vxlan0`
 
 初始化，设备创建及打开
 =============
@@ -420,7 +489,7 @@ static int vxlan_open(struct net_device *dev)
 
 #### 创建vxlan_sock
 
-创建UDP Socket即`vxlan_sock`需要单独提一下，因为他牵涉到如何向UDP模块注册回调函数来接收vxlan数据等细节。
+创建UDP Socket时候会向UDP tunnel注册回调函数来接收vxlan数据。
 
 ```C
 static int __vxlan_sock_add(struct vxlan_dev *vxlan, bool ipv6)
@@ -462,7 +531,7 @@ static struct vxlan_sock *vxlan_socket_create(struct net *net, bool ipv6,
 
         /* Mark socket as an encapsulation socket. */
         memset(&tunnel_cfg, 0, sizeof(tunnel_cfg));
-        tunnel_cfg.sk_user_data = vs;
+        tunnel_cfg.sk_user_data = vs;                       // 隧道用户数据为vxlan_sock
         tunnel_cfg.encap_type = 1;
         tunnel_cfg.encap_rcv = vxlan_rcv;                // 设置UDP tunnel的接收函数vxlan_rcv
         tunnel_cfg.encap_destroy = NULL;
@@ -478,7 +547,116 @@ static struct vxlan_sock *vxlan_socket_create(struct net *net, bool ipv6,
 数据接收
 ========
 
+#### RX主要流程
+
+打开（enable）VXLAN设备的时候，向UDP tunnel注册了接收数据的callback，即`vxlan_rcv`。其中，`sock.sk_user_data`即对应的`vxlan_sock`（见`vxlan_socket_create`）。
+
+```C
+vxlan_rcv(struct sock *sk, struct sk_buff *skb)
+        +
+        |- sanity check
+        |- vs = rcu_dereference_sk_user_data(sk)    // 取出vxlan_sock
+        |- vni = vxlan_vni(vxlan_hdr(skb)->vx_vni)  // 取出VXLAN首部的VNI字段
+        |- vxlan = vxlan_vs_find_vni(vs, vni)      // 以VNI为Key查找vxlan_sock.vni_list，找到对应的vxlan_dev
+        |  //如果没有对应的vxlan说明该VNI无人接收，则立即丢弃。
+        |
+        |- __iptunnel_pull_header(...)             // 根据inner Ethernet头设置skb->protocol
+        |- vxlan_set_mac(vxlan, vs, skb, vni) // 重设skb相关dev/protocol字段，地址学习（data-plane learning）
+        |        +
+        |        |- skb_reset_mac_header(skb)
+        |        |- skb->protocol = eth_type_trans(skb, vxlan->dev); // 设置skb.dev为vxlan_dev.dev，调整skb.protocol
+        |        |- 重新计算checksum
+        |        |- 防止循环：丢弃源MAC是vxlan_dev地址的包
+        |        |- vxlan_snoop(skb->dev, &saddr, eth_hdr(skb)->h_source, vni)
+        |            // control-plane学习，即学习源MAC和源VTEP的IP，记录到FDB，后续发往该MAC使用Unicast UDP。
+        |            // 之前可能已经被学习过而存在于FDB。
+        |
+        |- skb_reset_network_header(skb);
+        |- ENC处理及收包统计（vxlan->dev->tstats）
+        |- gro_cells_receive(&vxlan->gro_cells, skb) // 收包 netif_rx或者加入GRO NAPI队列后调度napi_schedule
+            // 此时skb->dev是vxlan->dev，后续进入正常的netif/napi收包流程
+}
+```
+
+#### Data-plane学习
+
+`vxlan_snoop`完成MAC地址学习。
+
+```
+vxlan_snoop(skb->dev, &saddr, eth_hdr(skb)->h_source, vni)
+          +
+          |-  f = vxlan_find_mac(vxlan, src_mac, vni);  // 查询FDB看源MAC是否已经存在
+          |-  if (likely(f)) // 已经存在
+          |           +
+          |           |- // 源IP和FDB Entry的相同，则直接返回。否则，如果不是静态配置的，则更新Entry的VTEP源IP。
+          |-  else // 不存在
+                      +
+                      |-  vxlan_fdb_create(...) //不存在，则创建FDB条目。
+```
+
 数据发送
 ========
 
+#### vxlan_xmit
 
+之前提到`vxlan_dev`的`net_device_ops.ndo_start_xmit`是`vxlan_xmit`，该函数用于封装overlay的Ethernet数据为vxlan数据进行发送。
+
+> 忽略flow-based tunnelling （VXLAN_F_COLLECT_METADATA）和ARP Proxy（VXLAN_F_PROXY）功能。
+
+```C
+static netdev_tx_t vxlan_xmit(struct sk_buff *skb, struct net_device *dev)
+```
+
+1. 根据目的MAC查找FDB条目，可以支持“[RSC (route shortcircuit)](http://events.linuxfoundation.org/sites/events/files/slides/2013-linuxcon.pdf)”优化。
+2. 如果查找失败，用全0 MAC进行查找默认的Destination对应的FDB条目。这个条目在`__vxlan_dev_create`的时候被创建，如果默认destination的IP合法的话。通常这个IP是VXLAN多播。如果还没找到，则丢弃。
+3. 遍历FDB条目(`vxlan_fdb`）的每个remotes（`vxlan_rdst`），每个remote都发送一个skb（多个remote需要`skb_clone`）。
+
+
+```C
+static netdev_tx_t vxlan_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+        ... ...
+        eth = eth_hdr(skb);   
+        f = vxlan_find_mac(vxlan, eth->h_dest, vni);
+        did_rsc = false;      
+
+        if (f && (f->flags & NTF_ROUTER) && (vxlan->flags & VXLAN_F_RSC) &&
+            (ntohs(eth->h_proto) == ETH_P_IP ||
+             ntohs(eth->h_proto) == ETH_P_IPV6)) {
+                did_rsc = route_shortcircuit(dev, skb);
+                if (did_rsc)  
+                        f = vxlan_find_mac(vxlan, eth->h_dest, vni);
+        }
+
+        if (f == NULL) {
+                f = vxlan_find_mac(vxlan, all_zeros_mac, vni);
+                if (f == NULL) {
+                        if ((vxlan->flags & VXLAN_F_L2MISS) &&
+                            !is_multicast_ether_addr(eth->h_dest))
+                                vxlan_fdb_miss(vxlan, eth->h_dest);
+
+                        dev->stats.tx_dropped++;
+                        kfree_skb(skb);
+                        return NETDEV_TX_OK;
+                }
+        }
+
+        list_for_each_entry_rcu(rdst, &f->remotes, list) {
+                struct sk_buff *skb1;
+
+                if (!fdst) {
+                        fdst = rdst;
+                        continue;
+                }
+                skb1 = skb_clone(skb, GFP_ATOMIC);
+                if (skb1)
+                        vxlan_xmit_one(skb1, dev, vni, rdst, did_rsc);
+        }
+
+        if (fdst)
+                vxlan_xmit_one(skb, dev, vni, fdst, did_rsc);
+        else
+                kfree_skb(skb);
+        return NETDEV_TX_OK;
+}
+```

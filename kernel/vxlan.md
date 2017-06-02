@@ -660,3 +660,10 @@ static netdev_tx_t vxlan_xmit(struct sk_buff *skb, struct net_device *dev)
         return NETDEV_TX_OK;
 }
 ```
+
+参考资料
+======
+
+1. [Software Defined Networking using VXLAN](http://events.linuxfoundation.org/sites/events/files/slides/2013-linuxcon.pdf)
+2. [vxlan.txt](https://www.kernel.org/doc/Documentation/networking/vxlan.txt)
+3. [RFC7348](https://tools.ietf.org/html/rfc7348)

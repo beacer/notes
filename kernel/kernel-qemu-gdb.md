@@ -168,8 +168,6 @@ $ sudo qemu-system-x86_64 -kernel linux/arch/x86/boot/bzImage -append 'root=/dev
 Waiting for gdb connection on device 'tcp::1234'
 ```
 
-> 或这直接使用qemu的`-serial`选项启动内核: `-serial tcp::4321,server`.
-
 打开另一个终端，使用调试工具(gdb/ddd/cgdb)调试vmlinux文件，并连接gdb server．
 
 ```shell
@@ -177,17 +175,24 @@ $ cd linux
 $ gdb vmlinux
 ... ...
 Reading symbols from vmlinux...done.
-(gdb) target remote localhost:1234
-Remote debugging using localhost:1234
-0xffffffffa4f88b50 in ?? ()
+(gdb) target remote 127.0.0.1:1234
+Remote debugging using 127.0.0.1:1234
+default_idle () at arch/x86/kernel/process.c:355
 (gdb) b ip_rcv
-Breakpoint 1 at 0xffffffff817d9b70: file net/ipv4/ip_input.c, line 413.
+Breakpoint 1 at 0xffffffff817dab80: file net/ipv4/ip_input.c, line 413.
 (gdb) c
 Continuing.
+
+Breakpoint 1, ip_rcv (skb=0xffff880007175000, dev=0xffff88000726f000, pt=0xffffffff8233ec20 <ip_packet_type>, orig_
+dev=0xffff88000726f000) at net/ipv4/ip_input.c:413
+(gdb)
 ```
+
+> 要触发上述断电，可以切换回qemu的调试kernel．为`lo`接口添加`127.0.0.1/8`地址并使能`lo`接口，然后`ping`环回地址．
+
 
 # 参考
 
-https://www.jianshu.com/p/02557f0d29dc
-http://blog.csdn.net/ganggexiongqi/article/details/5877756
-https://www.binss.me/blog/how-to-debug-linux-kernel/
+* https://www.jianshu.com/p/02557f0d29dc
+* http://blog.csdn.net/ganggexiongqi/article/details/5877756
+* https://www.binss.me/blog/how-to-debug-linux-kernel/

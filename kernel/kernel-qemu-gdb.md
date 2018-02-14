@@ -156,7 +156,9 @@ $ sudo apt-get install qemu # 或 Fedora/CentOS: yum install qemu
 $ sudo qemu-system-x86_64 -kernel linux/arch/x86/boot/bzImage -append 'root=/dev/sda' -boot c -hda rootfs.img -k en-us
 ```
 
-> tips: 使用`ctrl+alt+2`切换qemu控制台,使用`ctrl+alt+1`切换回调试kernel
+> tips: 
+> * 使用`ctrl+alt+2`切换qemu控制台,使用`ctrl+alt+1`切换回调试kernel
+> * 使用`ctrl+alt`将被qemu VM捕获的鼠标焦点切换回host
 
 
 ## 通过qemu和gdb调试kernel
@@ -188,11 +190,64 @@ dev=0xffff88000726f000) at net/ipv4/ip_input.c:413
 (gdb)
 ```
 
-> 要触发上述断电，可以切换回qemu的调试kernel．为`lo`接口添加`127.0.0.1/8`地址并使能`lo`接口，然后`ping`环回地址．
+> 要触发上述断点，可以切换回qemu的调试kernel．为`lo`接口添加`127.0.0.1/8`地址并使能`lo`接口，然后`ping`环回地址．
+
+## 调试网络
+
+### 网络设备设置
+
+我们使用qemu的**bridge模式**设置虚机网络，该模式需要在宿主机配置网桥，并使用该网桥配置地址和默认路由．具体见host的`/etc/qemu-ifup`文件．
+然后使用`-net`参数启动qemu虚机．
+
+> 如果通过宿主机eth0远程登录，该操作可能导致网络登录中断．
+
+```shell
+host $ sudo brctl addbr br0
+host $ sudo brctl addif br0 eth0
+host $ sudo ifconfig eth0 0
+host $ sudo dhclient br0
+host $ sudo qemu-system-x86_64 -kernel linux/arch/x86/boot/bzImage \
+       -append 'root=/dev/sda' -boot c -hda rootfs.img -k en-us \
+       -net nic -net tap,ifname=tap0
+```
+
+`tap0`是在宿主机中对应的接口名．我们可以在宿主机中看到网桥及其两个端口．tap设备的另一端是VM的eth0．
+
+```shell
+host $ brctl show
+bridge name     bridge id               STP enabled     interfaces
+br0             8000.1866da0573d1       no              eth0
+                                                        tap0
+```
+
+为简单测试VM和宿主机的网络联通性，我们在宿主机的`br0`和虚机的`eth0`分别配置两个私有地址来测试．
+
+```shell
+# qemu VM（调试Kernel）
+/ # ip addr add 192.168.0.2/24 dev eth0 
+/ # ip link set eth0 up
+```
+
+```shell
+# 宿主机
+host $ sudo ip addr add 192.168.0.1/24 dev br0
+host $ ping 192.168.0.2
+PING 192.168.0.2 (192.168.0.2) 56(84) bytes of data.
+64 bytes from 192.168.0.2: icmp_seq=1 ttl=64 time=0.328 ms
+64 bytes from 192.168.0.2: icmp_seq=2 ttl=64 time=0.282 ms
+... ...
+```
+
+这样可以基本满足调试Kernel的网络协议栈的环境了.
+
+> 或者在VM中运行`udhcpc eth0`让VM获取和host相同网络的IP，不过这需要DHCP Server的支持．
+
+## 调试内核模块
 
 
-# 参考
+## 参考
 
 * https://www.jianshu.com/p/02557f0d29dc
 * http://blog.csdn.net/ganggexiongqi/article/details/5877756
 * https://www.binss.me/blog/how-to-debug-linux-kernel/
+* https://www.jianshu.com/p/110b60c14a8b

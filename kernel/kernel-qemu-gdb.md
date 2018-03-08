@@ -242,8 +242,52 @@ PING 192.168.0.2 (192.168.0.2) 56(84) bytes of data.
 
 > 或者在VM中运行`udhcpc eth0`让VM获取和host相同网络的IP，不过这需要DHCP Server的支持．
 
-## 调试内核模块
+## 使用nfs挂载rootfs
 
+调试内核模块（或其他用户态程序的时候），挂载静态的ext3文件系统并不方便．为此我们可以采用nfs的形式挂载qemu kernel的rootfs，这样就能方便的在host中修改，编译内核模块，并在qemu kernel中配合gdb进行调试．根文件系统制作方法和之前相同，
+
+```
+# host working dir
+host $ mkdir rootfs.nfs
+host $ cp -a busybox-1.27.2/_install/* rootfs.nfs/
+host $ pushd rootfs.nfs/
+host $ mkdir dev sys proc etc lib mnt
+host $ popd
+host $ cp -a busybox-1.27.2/examples/bootfloppy/etc/* rootfs.nfs/etc/
+host $ cat rootfs.nfs/etc/init.d/rcS
+#! /bin/sh
+
+/bin/mount -a
+/bin/mount -t sysfs sysfs /sys
+/bin/mount -t tmpfs tmpfs /dev
+/sbin/mdev -s
+
+host $ chmod -R 777 rootfs.nfs/
+```
+
+配置host的nfs服务并启动,
+
+```
+host $ apt-get install nfs-kernel-server
+host $ cat /etc/exports
+/path/to/working/dir/rootfs.nfs *(rw,insecure,sync,no_root_squash)
+
+host $ service nfs-kernel-server restart
+```
+
+使用nfs挂载qemu Kernel的根文件系统
+
+```
+host $ sudo qemu-system-x86_64 -kernel linux/arch/x86/boot/bzImage \
+        -append 'root=/dev/nfs nfsroot="192.168.1.1:/path/to/working/dir/rootfs.nfs/" rw ip=192.168.1.2' \
+	-boot c -k en-us -net nic -net tap,ifname=tap0
+```
+
+其中`nfsroot`为host的IP及要挂载的根文件系统在host中的路径，`ip`参数填写qemu Kernel将使用的IP地址．
+
+### 调试内核模块
+
+> Note: 编译内核模块的时候，源码树和虚机Kernel编译需要是同一份．不然会出现模块版本不匹配无法运行的情况.
 
 ## 参考
 
@@ -251,3 +295,4 @@ PING 192.168.0.2 (192.168.0.2) 56(84) bytes of data.
 * http://blog.csdn.net/ganggexiongqi/article/details/5877756
 * https://www.binss.me/blog/how-to-debug-linux-kernel/
 * https://www.jianshu.com/p/110b60c14a8b
+* https://help.ubuntu.com/community/SettingUpNFSHowTo

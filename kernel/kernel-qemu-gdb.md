@@ -267,7 +267,7 @@ host $ chmod -R 777 rootfs.nfs/
 
 配置host的nfs服务并启动,
 
-```
+```shell
 host $ apt-get install nfs-kernel-server
 host $ cat /etc/exports
 /path/to/working/dir/rootfs.nfs *(rw,insecure,sync,no_root_squash)
@@ -287,7 +287,47 @@ host $ sudo qemu-system-x86_64 -kernel linux/arch/x86/boot/bzImage \
 
 ### 调试内核模块
 
-> Note: 编译内核模块的时候，源码树和虚机Kernel编译需要是同一份．不然会出现模块版本不匹配无法运行的情况.
+> Note: 编译内核模块的时候，源码树和虚机Kernel编译需要是同一份．不然会出现模块版本不匹配无法运行的情况. 编译内核模块的时候，使用`ccflags-y += -g -O0`保留信息避免优化．
+
+Kernel模块每次插入后的内存位置不确定，需要将其各个内存段的位置取出才能按源码单步调试． 首先在`do_init_module`设置断点, insmod的时候会触发断点，
+
+```gdb
+(gdb) b do_init_module
+```
+
+模块各内存段信息保存在`mod->sect_attrs->attrs[]`数组中，我们需要以下几个字段信息,
+
+* `.text`
+* `.rodata`
+* `.bss`
+
+分别打印字段的名字和其地址，
+
+```gdb
+(gdb) print  mod->sect_attrs->attrs[1].name
+$82 = 0xffff880006109ad8 <__this_cpu_preempt_check> ".text"
+(gdb) print  mod->sect_attrs->attrs[5].name
+$86 = 0xffff880006109ad0 <__phys_addr_nodebug+10> ".rodata"
+(gdb) print  mod->sect_attrs->attrs[12].name
+$93 = 0xffff880006109ac8 <__phys_addr_nodebug+2> ".bss"
+
+(gdb) print /x  mod->sect_attrs->attrs[1]->address
+$96 = 0xffffffffa0005000
+(gdb) print /x  mod->sect_attrs->attrs[5]->address
+$97 = 0xffffffffa0006040
+(gdb) print /x  mod->sect_attrs->attrs[12]->address
+$98 = 0xffffffffa0007380
+```
+
+然后为gdb设置模块路径和各内存段地址，
+
+```gdb
+(gdb) add-symbol-file /path/to/module/xxx.ko 0xffffffffa0005000 \
+-s .data 0xffffffffa0006040 \
+-s .bss 0xffffffffa0007380
+```
+
+接下来，就能为模块的各个函数设置断点进行调试了．
 
 ## 参考
 

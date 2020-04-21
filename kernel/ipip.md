@@ -327,7 +327,7 @@ ip_rcv
    +
    |- ip_rcv_finish
        +
-       |- 理由查询
+       |- 路由查询
        |- rt->dst.input 即 ip_local_deliver # 路由查询结果Local IN
             +
             |- ip_local_deliver_finish
